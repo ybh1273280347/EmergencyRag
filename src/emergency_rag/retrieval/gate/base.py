@@ -1,10 +1,10 @@
 from abc import ABC
 
-from emergency_rag.retrieval.models import Candidate
+from emergency_rag.retrieval.models import RuleEvidence
 
 
-class CandidateGate(ABC):
-    """候选过滤接口，默认放行全部候选。"""
+class EvidenceGate(ABC):
+    """完整规则证据的过滤接口，默认放行全部规则。"""
 
-    def filter(self, candidates: list[Candidate]) -> list[Candidate]:
-        return candidates
+    def filter(self, evidence: list[RuleEvidence]) -> list[RuleEvidence]:
+        return evidence

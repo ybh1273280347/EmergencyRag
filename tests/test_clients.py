@@ -100,7 +100,7 @@ def test_rerank_batch_alignment_and_full_scores(candidate):
         results = reranker.rerank("<危险&事故>", originals)
     assert [item.unit_id for item in results] == ["b", "c", "a"]
     assert [item.final_score for item in results] == [0.9, 0.7, 0.1]
-    assert all(item.final_rank is None for item in results)
+    assert all("final_rank" not in item.model_dump() for item in results)
     assert all(item.final_score is None for item in originals)
     assert [body["top_n"] for body in calls] == [2, 1]
     assert "&lt;危险&amp;事故&gt;" in calls[0]["query"]

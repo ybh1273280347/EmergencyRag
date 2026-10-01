@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from emergency_rag.chunking.rule import RuleChunker
+from emergency_rag.unit_building.rule import RuleUnitBuilder
 from emergency_rag.clients.chat import ChatClient
 from emergency_rag.clients.embedding import EmbeddingClient
 from emergency_rag.data.pipeline import DatasetPipeline
@@ -31,7 +31,7 @@ def run_experiment(
     dataset = DatasetPipeline(
         embedding=embedding,
         index_root=index_root,
-        chunker=RuleChunker(),
+        unit_builder=RuleUnitBuilder(),
         tokenizer=JiebaTokenizer(),
     ).prepare(source, dataset_name=dataset_name)
     pipeline = RetrievalPipeline(
@@ -42,10 +42,10 @@ def run_experiment(
     )
 
     result = pipeline.retrieve(question, top_k=top_k)
-    # 作答用例只传最终候选；题型、提示词和答案格式由实验指定。
+    # 作答用例只传最终完整规则证据；题型、提示词和答案格式由实验指定。
     context = "\n\n".join(
-        f"[规则 {candidate.rule_id}]\n{candidate.text}"
-        for candidate in result.candidates
+        f"[规则 {evidence.rule_id}]\n{evidence.text}"
+        for evidence in result.evidence
     )
     answer = chat.complete(
         model=chat_model,

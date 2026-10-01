@@ -18,6 +18,7 @@ from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 class Rule(BaseModel):
     rule_id: str
     text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("rule_id", "text")
     @classmethod
@@ -30,15 +31,17 @@ class Rule(BaseModel):
 class SearchUnit(BaseModel):
     unit_id: str
     rule_id: str
-    text: str
+    text: str  # 单元原文，用于重排和命中记录。
+    index_text: str  # 离线索引文本，可以包含主题、领域等增强内容。
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def dataset_index_directory(index_root: Path, dataset_name: str, strategy: str, tokenizer_name: str) -> Path:
     """准备与构建共用的目录命名规则，在读取原始文件前即可确定位置。"""
+    # 名称直接用于写入和替换目录，限制为英文策略名，避免路径片段越过 index_root。
     for name in (dataset_name, strategy, tokenizer_name):
-        if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", name) is None:
-            raise ValueError("dataset、chunker strategy 和 tokenizer name 必须为小写英文名称，可包含数字和连字符")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", name):
+            raise ValueError("数据集、单元构建和分词策略必须使用小写英文名称，可包含数字和连字符")
     return (Path(index_root) / f"{dataset_name}-{strategy}-{tokenizer_name}").resolve()
 
 
@@ -47,12 +50,15 @@ class IndexedDataset:
     directory: Path
     # 从准备流水线携带同一分词器，检索组件不再接受独立分词配置。
     tokenizer: TextTokenizer
+    rules: dict[str, Rule] = field(init=False)
     units: dict[str, SearchUnit] = field(init=False)
     _bm25: tuple[bm25s.BM25, Tokenizer, list[str]] | None = field(default=None, init=False, repr=False)
     _dense: tuple[faiss.IndexFlatIP, list[str]] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.directory = Path(self.directory).resolve()
+        records = json.loads((self.directory / "rules.json").read_text(encoding="utf-8"))
+        self.rules = {record["rule_id"]: Rule(**record) for record in records}
         records = json.loads((self.directory / "units.json").read_text(encoding="utf-8"))
         self.units = {record["unit_id"]: SearchUnit(**record) for record in records}
         # Dataset 拥有索引资源，加载时一次性读取已有产物；查询只复用内存对象。

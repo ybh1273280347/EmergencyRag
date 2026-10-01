@@ -15,7 +15,7 @@ def test_rrf_calculation_dedup_and_score_boundary(candidate):
     assert results[0].sources == ["bm25", "dense"]
     assert [obs["score"] for obs in results[0].metadata["retrieval"]] == [8, 0.8]
     assert [obs["rank"] for obs in results[0].metadata["retrieval"]] == [1, 2]
-    assert all(item.final_score is None and item.final_rank is None for item in results)
+    assert all(item.final_score is None for item in results)
     assert a.sources == ["bm25"] and "fusion" not in a.metadata
 
 

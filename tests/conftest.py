@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 
 from emergency_rag.retrieval.models import Candidate
-from emergency_rag.data.models import IndexedDataset
+from emergency_rag.data.models import IndexedDataset, Rule
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +25,9 @@ def isolate_environment_and_network(monkeypatch):
 
 @pytest.fixture
 def dataset():
-    return Mock(spec=IndexedDataset)
+    dataset = Mock(spec=IndexedDataset)
+    dataset.rules = {key: Rule(rule_id=key, text=f"完整规则 {key}") for key in ("a", "b", "c")}
+    return dataset
 
 
 @pytest.fixture

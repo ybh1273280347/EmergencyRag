@@ -6,11 +6,11 @@ from emergency_rag.retrieval.retrievers.base import Retriever as RetrieverBase
 from emergency_rag.retrieval.fusion.base import Fusion as FusionBase
 from emergency_rag.retrieval.expansion.base import CandidateExpander
 from emergency_rag.retrieval.rerank.base import Reranker as RerankerBase
-from emergency_rag.retrieval.gate.base import CandidateGate
-from emergency_rag.retrieval.projector.base import EvidenceProjector
-from emergency_rag.retrieval.models import QueryContext
-from emergency_rag.retrieval.pipeline import RetrievalPipeline
-from emergency_rag.chunking.base import Chunker
+from emergency_rag.retrieval.gate.base import EvidenceGate
+from emergency_rag.retrieval.models import Candidate, QueryContext, RuleEvidence
+from emergency_rag.retrieval.pipeline import RetrievalPipeline, aggregate_rule_evidence
+from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.data.models import Rule
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 
 
@@ -39,7 +39,7 @@ def make_pipeline(candidate, events, dataset):
             return [candidate("a"), candidate("b"), candidate("c")]
 
     class Expander(CandidateExpander):
-        def expand(self, query_ctx, candidates):
+        def expand(self, candidates):
             events.append(("expansion", len(candidates)))
             return candidates
 
@@ -50,22 +50,18 @@ def make_pipeline(candidate, events, dataset):
             events.append(("rerank", query, len(candidates)))
             return [item.model_copy(update={"final_score": score}) for item, score in zip(candidates, [0.9, 0.8, 0.7])]
 
-    class Gate(CandidateGate):
-        def filter(self, candidates):
-            events.append(("gate", len(candidates)))
-            return candidates[1:]
-
-    class Projector(EvidenceProjector):
-        def project(self, candidates):
-            events.append(("projector", len(candidates)))
-            return candidates
+    class Gate(EvidenceGate):
+        def filter(self, evidence):
+            assert all(isinstance(item, RuleEvidence) for item in evidence)
+            events.append(("gate", len(evidence)))
+            return evidence[1:]
 
     return RetrievalPipeline(
         dataset=dataset,
         query_processor=QueryProcessor(),
         retrievers=[Retriever("bm25", 7), Retriever("dense", 11)],
         fusion=Fusion(), expander=Expander(), reranker=Reranker(),
-        gate=Gate(), projector=Projector(),
+        gate=Gate(),
     )
 
 
@@ -78,16 +74,18 @@ def test_lifecycle_and_final_limit_after_gate(candidate, dataset):
         ("bm25", "改写查询", 7), ("dense", "改写查询", 11),
         ("bm25", "子查询", 7), ("dense", "子查询", 11),
         ("fusion", 4), ("expansion", 3), ("rerank", "原查询", 3),
-        ("gate", 3), ("projector", 1),
+        ("gate", 3),
     ]
-    assert [item.unit_id for item in result.candidates] == ["b"]
-    assert result.candidates[0].final_rank == 1
+    assert result.query == "原查询"
+    assert [item.rule_id for item in result.evidence] == ["b"]
+    assert result.evidence[0].final_rank == 1
+    assert result.evidence[0].text == dataset.rules["b"].text
     assert result.metadata["retrieval_counts"] == {"bm25": 2, "dense": 2}
-    assert result.metadata["candidate_counts"] == {"fusion": 3, "final": 1}
+    assert result.metadata["candidate_counts"] == {"fusion": 3, "rules": 3, "final": 1}
     assert result.metadata["latency_ms"] >= 0
     assert result.metadata["reranker"] == "test-reranker"
-    assert len(pipeline.retrieve("原查询").candidates) == 2
-    assert len(pipeline.retrieve("原查询", top_k=100).candidates) == 2
+    assert len(pipeline.retrieve("原查询").evidence) == 2
+    assert len(pipeline.retrieve("原查询", top_k=100).evidence) == 2
 
 
 @pytest.mark.parametrize("query,top_k", [(" ", 1), (None, 1), ("问题", 0), ("问题", -1), ("问题", True), ("问题", 1.5)])
@@ -96,7 +94,7 @@ def test_invalid_public_input(candidate, query, top_k, dataset):
         make_pipeline(candidate, [], dataset).retrieve(query, top_k)
 
 
-@pytest.mark.parametrize("interface", [Chunker, RetrieverBase, FusionBase, TextTokenizer])
+@pytest.mark.parametrize("interface", [UnitBuilder, RetrieverBase, FusionBase, TextTokenizer])
 def test_algorithm_interfaces_require_implementation(interface):
     with pytest.raises(TypeError):
         interface()
@@ -120,17 +118,18 @@ def test_default_stage_implementations(candidate, dataset):
     assert type(pipeline.query_processor) is QueryProcessorBase
     assert type(pipeline.reranker) is RerankerBase
     assert type(pipeline.expander) is CandidateExpander
-    assert type(pipeline.gate) is CandidateGate
-    assert type(pipeline.projector) is EvidenceProjector
+    assert type(pipeline.gate) is EvidenceGate
     result = pipeline.retrieve("保留原查询")
-    assert result.candidates[0].final_score is None
-    assert result.candidates[0].final_rank == 1
-    assert result.candidates[0].metadata["retrieval"][0]["query"] == "保留原查询"
+    assert result.evidence[0].final_score is None
+    assert result.evidence[0].final_rank == 1
+    assert result.evidence[0].matched_units[0].metadata["retrieval"][0]["query"] == "保留原查询"
     ctx = pipeline.query_processor.process("问题")
     assert ctx.queries == ["问题"]
-    assert pipeline.expander.expand(ctx, result.candidates) is result.candidates
-    assert pipeline.gate.filter(result.candidates) is result.candidates
-    assert pipeline.projector.project(result.candidates) is result.candidates
+    units = result.evidence[0].matched_units
+    assert pipeline.expander.expand(units) is units
+    assert pipeline.gate.filter(result.evidence) is result.evidence
+    assert not hasattr(pipeline, "projector")
+    assert not hasattr(result, "candidates")
 
 
 def test_default_reranker_returns_input_unchanged(candidate):
@@ -155,11 +154,11 @@ def test_query_context_combines_rewrite_and_subqueries_without_mutation():
 
 
 def test_custom_falsy_component_is_not_replaced_by_default(candidate, dataset):
-    class FalsyGate(CandidateGate):
+    class FalsyGate(EvidenceGate):
         def __bool__(self):
             return False
 
-        def filter(self, candidates):
+        def filter(self, evidence):
             return []
 
     pipeline = make_pipeline(candidate, [], dataset)
@@ -170,7 +169,7 @@ def test_custom_falsy_component_is_not_replaced_by_default(candidate, dataset):
         gate=custom,
     )
     assert configured.gate is custom
-    assert configured.retrieve("问题").candidates == []
+    assert configured.retrieve("问题").evidence == []
 
 
 def test_caller_can_supply_unlisted_component_types(candidate, dataset):
@@ -199,9 +198,104 @@ def test_caller_can_supply_unlisted_component_types(candidate, dataset):
         retrievers=(ArchiveRetriever(),), fusion=FirstFusion(), reranker=LocalReranker(),
     )
     result = pipeline.retrieve("查档案")
-    assert result.candidates[0].sources == ["archive"]
-    assert result.candidates[0].final_score == 0.75
+    assert result.evidence[0].sources == ["archive"]
+    assert result.evidence[0].final_score == 0.75
     assert result.metadata["active_retrievers"] == ["archive"]
     assert result.metadata["fusion_strategy"] == "first"
     assert result.metadata["reranker"] == "local"
+
+
+def test_rule_aggregation_max_score_full_text_and_matches(dataset):
+    dataset.rules = {
+        "37": Rule(rule_id="37", text="完整规则 37", metadata={"domain": {"name": "化学品"}}),
+        "463": Rule(rule_id="463", text="完整规则 463"),
+    }
+    candidates = [
+        Candidate(unit_id="sub_rule:37:1", rule_id="37", text="条件一", final_score=0.95,
+                  sources=["dense"], metadata={"offset": 8, "retrieval": [{"rank": 1}]}),
+        Candidate(unit_id="rule:37", rule_id="37", text="完整规则 37", final_score=0.90, sources=["bm25"]),
+        Candidate(unit_id="sub_rule:37:2", rule_id="37", text="条件二", final_score=0.88, sources=["dense"]),
+        Candidate(unit_id="rule:463", rule_id="463", text="完整规则 463", final_score=0.85, sources=["bm25"]),
+    ]
+    evidence = aggregate_rule_evidence(candidates, dataset)
+    assert [(item.rule_id, item.final_score) for item in evidence] == [("37", 0.95), ("463", 0.85)]
+    assert evidence[0].text == dataset.rules["37"].text
+    assert evidence[0].matched_units == candidates[:3]
+    assert evidence[0].matched_units[0].metadata["offset"] == 8
+    assert evidence[0].sources == ["dense", "bm25"]
+    assert evidence[0].final_rank is None
+    assert candidates[0].text == "条件一"
+    evidence[0].metadata["domain"]["name"] = "修改"
+    assert dataset.rules["37"].metadata["domain"]["name"] == "化学品"
+
+
+@pytest.mark.parametrize("scored", [True, False])
+def test_rule_aggregation_score_ties_or_first_occurrence(candidate, dataset, scored):
+    candidates = [candidate("b"), candidate("a"), candidate("b:sub")]
+    candidates[2].rule_id = "b"
+    if scored:
+        for item in candidates:
+            item.final_score = 0.5
+    evidence = aggregate_rule_evidence(candidates, dataset)
+    assert [item.rule_id for item in evidence] == (["a", "b"] if scored else ["b", "a"])
+    assert [item.final_score for item in evidence] == ([0.5, 0.5] if scored else [None, None])
+    assert len(next(item for item in evidence if item.rule_id == "b").matched_units) == 2
+
+
+def test_top_k_counts_rules_and_gate_receives_all_aggregated_rules(candidate, dataset):
+    candidates = [candidate("a"), candidate("a:1"), candidate("a:2"), candidate("b"), candidate("c")]
+    for item in candidates[:3]:
+        item.rule_id = "a"
+    for item, score in zip(candidates, [0.95, 0.90, 0.88, 0.85, 0.80]):
+        item.final_score = score
+
+    class Retriever(RetrieverBase):
+        name = "test"
+
+        def retrieve(self, query, dataset):
+            return candidates
+
+    class Fusion(FusionBase):
+        name = "test"
+
+        def fuse(self, result_sets):
+            return result_sets[0]
+
+    class Gate(EvidenceGate):
+        def filter(self, evidence):
+            assert [item.rule_id for item in evidence] == ["a", "b", "c"]
+            assert evidence[0].final_score == 0.95
+            assert len(evidence[0].matched_units) == 3
+            return evidence[1:]
+
+    pipeline = RetrievalPipeline(dataset=dataset, retrievers=[Retriever()], fusion=Fusion())
+    result = pipeline.retrieve("问题", top_k=2)
+    assert [item.rule_id for item in result.evidence] == ["a", "b"]
+    assert [item.final_rank for item in result.evidence] == [1, 2]
+    pipeline.gate = Gate()
+    result = pipeline.retrieve("问题", top_k=2)
+    assert [item.rule_id for item in result.evidence] == ["b", "c"]
+    assert [item.final_rank for item in result.evidence] == [1, 2]
+    assert result.metadata["candidate_counts"] == {"fusion": 5, "rules": 3, "final": 2}
+
+
+def test_empty_rule_evidence(candidate, dataset):
+    assert aggregate_rule_evidence([], dataset) == []
+    pipeline = make_pipeline(candidate, [], dataset)
+
+    class EmptyRetriever(RetrieverBase):
+        name = "empty"
+
+        def retrieve(self, query, dataset):
+            return []
+
+    class EmptyFusion(FusionBase):
+        name = "empty"
+
+        def fuse(self, result_sets):
+            return []
+
+    pipeline.retrievers = [EmptyRetriever()]
+    pipeline.fusion = EmptyFusion()
+    assert pipeline.retrieve("问题").evidence == []
 
