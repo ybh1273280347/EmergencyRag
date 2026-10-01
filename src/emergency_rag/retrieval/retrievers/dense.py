@@ -13,22 +13,31 @@ class DenseRetriever(Retriever):
 
     name = "dense"
 
-    def __init__(self, embedding: EmbeddingClient, *, top_k: int = 30) -> None:
-        self.embedding = embedding
+    def __init__(self, embedding_client: EmbeddingClient, *, top_k: int = 30) -> None:
+        self.embedding = embedding_client
         self.top_k = top_k
 
     def retrieve(self, query: str, dataset: IndexedDataset) -> list[Candidate]:
         index, unit_ids = dataset.load_dense()
         if not unit_ids:
             return []
-        # 文档向量在离线构建时已归一化；在线只请求、归一化并搜索查询向量。
-        vector = np.ascontiguousarray(self.embedding.embed(query)[None, :], dtype=np.float32)
+
+        # 文档向量离线时已归一化；在线只需处理查询向量
+        vector = np.ascontiguousarray(
+            self.embedding.embed(query)[None, :],
+            dtype=np.float32,
+        )
         faiss.normalize_L2(vector)
+
+        # 取 top_k 与索引规模的最小值，避免越界请求
         scores, rows = index.search(vector, min(self.top_k, len(unit_ids)))
+
+        # 分数降序；同分按 unit_id 稳定排序
         ranked = sorted(
             zip(rows[0], scores[0]),
             key=lambda item: (-float(item[1]), unit_ids[int(item[0])]),
         )
+
         candidates = []
         for rank, (row, score) in enumerate(ranked, start=1):
             unit = dataset.units[unit_ids[int(row)]]
@@ -40,12 +49,15 @@ class DenseRetriever(Retriever):
                     sources=[self.name],
                     metadata={
                         **unit.metadata,
-                        "retrieval": [{
-                            "source": self.name,
-                            "query": query,
-                            "rank": rank,
-                            "score": float(score),
-                        }],
+                        # 记录本次召回来源、查询、名次与分数
+                        "retrieval": [
+                            {
+                                "source": self.name,
+                                "query": query,
+                                "rank": rank,
+                                "score": float(score),
+                            },
+                        ],
                     },
                 ),
             )

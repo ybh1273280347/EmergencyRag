@@ -1,0 +1,31 @@
+# 模型连接、模型名、超时和重试由对应模块读取环境配置，YAML 只声明实验参数。
+dataset:
+  source: ../datasets/初赛规则集rules1.json
+  dataset_name: preliminary
+  index_root: ../data/indexes
+  overwrite: false
+  unit_builder: rule
+  tokenizer: jieba
+
+retrieval:
+  retrievers:
+    - name: bm25
+      params:
+        top_k: 30
+    - name: dense
+      params:
+        top_k: 30
+  fusion:
+    name: rrf
+    params:
+      k: 60
+      top_k: 60
+  reranker:
+    name: zeroentropy
+    params:
+      instruction: 请评估规则片段与问题的相关性。
+      batch_size: 64
+  # 未声明的可选阶段使用 Pipeline 默认组件；可以显式声明以下名称。
+  query_processor: default
+  expander: default
+  gate: default

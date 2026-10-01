@@ -5,6 +5,7 @@ import bm25s
 import httpx
 import numpy as np
 import pytest
+import yaml
 from openai import OpenAI
 from zeroentropy import ZeroEntropy
 
@@ -28,6 +29,7 @@ from emergency_rag.data.indexing import (
     _save_bm25_index, _save_dense_index,
 )
 from emergency_rag.data.pipeline import read_rules
+from emergency_rag.load_pipeline import load_pipeline
 from examples.preliminary_experiment import run_experiment
 
 
@@ -497,23 +499,6 @@ def test_different_tokenizers_select_different_index_directories(built_indexes, 
 
 
 @pytest.mark.parametrize("metadata", [
-    {}, {"dataset": "preliminary"},
-    {"dataset": "../escape", "unit_builder": {"strategy": "rule"}},
-    {"dataset": "初赛", "unit_builder": {"strategy": "rule"}},
-    {"dataset": "preliminary", "unit_builder": {"strategy": "../rule"}},
-])
-def test_invalid_directory_provenance_is_rejected_offline(built_indexes, metadata, tmp_path):
-    units, embedding, directory, calls = built_indexes
-    invalid = [units[0].model_copy(update={"metadata": metadata})]
-    rules = list(IndexedDataset(directory, tokenizer=JiebaTokenizer()).rules.values())
-    target = tmp_path / "invalid"
-    with pytest.raises(ValueError, match="英文名称"):
-        build_dataset_indexes(invalid, target, rules=rules, tokenizer=JiebaTokenizer(), embedding=embedding)
-    assert not target.exists()
-    assert calls == []
-
-
-@pytest.mark.parametrize("metadata", [
     {"dataset": "semifinal", "unit_builder": {"strategy": "rule"}},
     {"dataset": "preliminary", "unit_builder": {"strategy": "sentence"}},
 ])
@@ -533,7 +518,7 @@ def test_mixed_dataset_or_unit_builder_is_rejected_offline(built_indexes, metada
     ("海冰观测频率？A. 每日 B. 每小时", "根据规则只返回选项字母。", "B"),
 ])
 @pytest.mark.parametrize("use_cache", [True, False])
-def test_experiment_prepares_retrieves_and_answers(built_indexes, question, instructions, answer, use_cache):
+def test_experiment_prepares_retrieves_and_answers(built_indexes, monkeypatch, question, instructions, answer, use_cache):
     units, embedding, directory, calls = built_indexes
     source = directory.parent / "experiment-rules.json"
     if use_cache:
@@ -543,6 +528,21 @@ def test_experiment_prepares_retrieves_and_answers(built_indexes, question, inst
         source.write_text(json.dumps([
             {"rule_id": unit.rule_id, "rule_text": unit.text} for unit in units
         ]), encoding="utf-8")
+    config_path = directory.parent / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "dataset": {
+            "source": str(source), "dataset_name": "preliminary",
+            "index_root": str(index_root),
+        },
+        "retrieval": {
+            "retrievers": [
+                "bm25", "dense",
+            ],
+            "fusion": "rrf",
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr("emergency_rag.clients.embedding.get_embedding_client", lambda: embedding)
+    pipeline = load_pipeline(config_path)
     requests = []
 
     def respond(request):
@@ -554,8 +554,8 @@ def test_experiment_prepares_retrieves_and_answers(built_indexes, question, inst
 
     with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
         result, actual = run_experiment(
-            embedding=embedding, chat=ChatClient(sdk), chat_model="answer-model", question=question,
-            instructions=instructions, top_k=1, index_root=index_root, source=source,
+            pipeline=pipeline, chat=ChatClient(sdk, model="answer-model"), question=question,
+            instructions=instructions, top_k=1,
         )
     assert actual == answer
     assert len(result.evidence) == 1

@@ -13,7 +13,7 @@ from emergency_rag.data.models import IndexedDataset, Rule
 @pytest.fixture(autouse=True)
 def isolate_environment_and_network(monkeypatch):
     for name in list(os.environ):
-        if name.startswith("RAG_"):
+        if name.startswith(("RAG_", "ZEROENTROPY_")):
             monkeypatch.delenv(name)
 
     def forbid_network(*args, **kwargs):

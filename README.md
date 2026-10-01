@@ -2,7 +2,7 @@
 
 规则知识库的同步检索组件库。Rule 通过可插拔 UnitBuilder 生成 SearchUnit，离线使用增强文本构建双路索引。在线先对 Unit 召回和重排，再按 rule_id 聚合成完整规则证据。最终 Top-K 按规则计数，结果由调用方传给作答模型。
 
-各阶段使用独立 ABC，简单参数直接通过构造函数注入。RetrievalPipeline 是 dataclass，Dataset 只注入一次；调用方选择 Retriever、Fusion、Reranker 和 EvidenceGate，无需注册、CLI、YAML、全局 Settings 或 Factory。
+各阶段使用独立 ABC，简单参数直接通过构造函数注入。RetrievalPipeline 是 dataclass，Dataset 只注入一次。调用方可以直接装配，也可以通过 YAML 注册名称声明组件，由 load_pipeline 完成装配。组件不读取 YAML，模型模块负责共享实例和环境配置。
 
 ## 数据与文本契约
 
@@ -71,7 +71,7 @@ UnitBuilder 接口是 `build(rules: list[Rule]) -> list[SearchUnit]`，负责单
 }
 ```
 
-策略名使用小写英文，可包含数字和连字符。不同划分、增强或分词实验应使用不同 name；相同名称下更换源数据或 embedding 模型时，通过 overwrite=True 显式重建。
+不同划分、增强或分词实验应使用不同 name；名称直接用于目录。相同名称下更换源数据或 embedding 模型时，通过 overwrite=True 显式重建。
 
 ```text
 data/indexes/
@@ -110,7 +110,7 @@ pipeline = RetrievalPipeline(
     dataset=dataset,
     retrievers=(
         BM25Retriever(top_k=30),
-        DenseRetriever(embedding=embedding_client, top_k=30),
+        DenseRetriever(embedding_client=embedding_client, top_k=30),
     ),
     fusion=RRFFusion(k=60, top_k=60),
 )
@@ -135,7 +135,73 @@ pipeline.reranker = ZeroEntropyReranker(
 )
 ```
 
-模型地址、密钥、超时和重试由调用方构造 SDK 时配置。EmbeddingClient 的模型与批大小直接传入，例如 `EmbeddingClient(embedding_sdk, model=embedding_model, batch_size=64)`。`.env.example` 仅为应用参考，库不读取环境变量。
+直接装配时，模型地址、密钥、超时和重试可以由调用方构造 SDK 时配置，例如 `EmbeddingClient(embedding_sdk, model=embedding_model, batch_size=64)`。YAML 加载使用模型模块提供的共享实例，读取 `.env.example` 中的进程环境变量；不自动读取 `.env`。
+
+## YAML 加载入口
+
+```python
+from emergency_rag.load_pipeline import load_pipeline
+
+pipeline = load_pipeline("config/baseline.yaml")
+result = pipeline.retrieve("危险化学品事故应急结束条件", top_k=10)
+```
+
+[config/baseline.yaml](config/baseline.yaml) 提供完整的 BM25 + Dense + RRF + ZeroEntropy 声明。按 `.env.example` 设置 Embedding 和 Reranker 的模型地址、模型名、密钥、超时和重试；这些服务配置不进入 YAML。作答模型由 Chat 模块提供，检索加载不会创建 Chat 实例。
+
+环境变量统一使用单下划线分隔：Embedding 为 `RAG_EMBEDDING_*`，Chat 为 `RAG_CHAT_*`。ZeroEntropy 使用专属的 `ZEROENTROPY_URL`、`ZEROENTROPY_API_KEY`、`ZEROENTROPY_MODEL`、`ZEROENTROPY_TIMEOUT` 和 `ZEROENTROPY_MAX_RETRIES`，不占用通用的 Rerank 配置名；其他重排实现可以使用自己的服务配置。
+
+加载函数返回 RetrievalPipeline，不返回配置包装对象。它先解析并构造全部需要的组件，再调用 DatasetPipeline.prepare，最后将 Dataset 注入 RetrievalPipeline。已有目录直接复用，缺失时自动构建，overwrite: true 时显式重建。加载一次后可遍历整个验证集，不要在每道题中重新加载。
+
+YAML 分为 dataset 和 retrieval 两部分，只声明数据路径、组件名称和实验参数。无参数的组件直接写名称，有参数时写 name 和 params。以下配置使用默认无打分 Reranker：
+
+```yaml
+dataset:
+  source: ../datasets/初赛规则集rules1.json
+  dataset_name: preliminary
+  index_root: ../data/indexes
+  unit_builder: rule
+  tokenizer: jieba
+
+retrieval:
+  retrievers:
+    - name: bm25
+      params: {top_k: 30}
+    - name: dense
+      params: {top_k: 30}
+  fusion: union
+```
+
+组件通过 registry.py 中的 COMPONENT_REGISTRY 显式登记，按阶段分组，使用实现类的 name 作为键。params 原样传入构造函数；省略 params 时使用组件默认参数。可选阶段省略时使用 Pipeline 默认实现，显式 null 不表示默认组件。
+
+注册名称包括 unit_builder 的 rule、tokenizer 的 jieba、retrievers 的 bm25/dense、fusion 的 rrf/union、reranker 的 default/zeroentropy；query_processor、expander 和 gate 的默认实现统一使用 default。
+
+自定义组件实现对应 ABC 后，在实验启动时登记一次。例如：
+
+```python
+from emergency_rag.registry import COMPONENT_REGISTRY
+
+COMPONENT_REGISTRY["unit_builder"][MyUnitBuilder.name] = MyUnitBuilder
+COMPONENT_REGISTRY["fusion"][MyFusion.name] = MyFusion
+# YAML 随后可使用 MyUnitBuilder.name 和 MyFusion.name。
+```
+
+需要模型等额外依赖的自定义组件，可以登记一个显式注入依赖的工厂函数。内置 Dense 和 ZeroEntropy 也是这样登记的；加载器不按算法名做分支。
+
+source 和 index_root 相对 YAML 所在目录解析，省略 index_root 时默认为该目录下的 data/indexes，与启动目录无关。最终 top_k 仍在 retrieve 调用时指定，表示规则数量，不进入 Pipeline 构造参数。
+
+共享模型入口位于各自模块：
+
+```python
+from emergency_rag.clients.embedding import get_embedding_client
+from emergency_rag.clients.chat import get_chat_client
+from emergency_rag.retrieval.rerank.zero_entropy import get_rerank_model
+```
+
+模型在首次使用时创建并缓存，不在模块导入时创建。设置环境变量后，Dataset 离线构建和各 DenseRetriever 共享同一个 EmbeddingClient；不同 load_pipeline 调用也复用它。ZeroEntropy 通过 get_rerank_model(instruction=..., batch_size=...) 获取重排器，相同参数复用同一实例，不同参数分别缓存。ChatClient 仅在作答用例调用时创建，初始化时确定模型名；get_chat_client() 从 RAG_CHAT_MODEL 读取它。
+
+环境变量在模型首次创建时读取；同一进程之后修改环境不会自动替换实例。无模型配置时仍可以导入组件或直接装配 mock 模型，实际请求共享模型时才报缺少配置。SDK 超时和重试默认 60 秒与 2 次，可用对应环境变量覆盖。
+
+配置使用 safe_load 解析。非法 YAML、未知注册名称、错误参数和不符合阶段 ABC 的组件明确报 PipelineConfigError。Dataset 构建、文件读取和模型调用失败保持原有异常，不静默降级或重建。
 
 ## 规则聚合与独立预算
 
@@ -172,23 +238,24 @@ QueryContext 保存 original_query、rewritten_query 和 sub_queries。queries �
 
 ## 一次实验与模型作答
 
-[examples/preliminary_experiment.py](examples/preliminary_experiment.py) 是唯一实验示例。UnitBuilder、Tokenizer 和检索组件集中配置，Dataset 自动构建或复用，执行后返回检索结果与答案：
+[examples/preliminary_experiment.py](examples/preliminary_experiment.py) 是唯一实验示例。Dataset 和检索组件通过 YAML 加载一次；实验函数负责提示词与模型作答，返回检索结果和原始答案：
 
 ```python
-from emergency_rag.clients.chat import ChatClient
+from emergency_rag.clients.chat import get_chat_client
+from emergency_rag.load_pipeline import load_pipeline
 from examples.preliminary_experiment import run_experiment
 
+pipeline = load_pipeline("config/baseline.yaml")
 result, answer = run_experiment(
-    embedding=embedding_client,
-    chat=ChatClient(chat_sdk),
-    chat_model=chat_model,
+    pipeline=pipeline,
+    chat=get_chat_client(),
     question="危险化学品事故应急结束需要满足哪些条件？",
     instructions="请根据参考规则回答问题，并注明规则编号。",
     top_k=10,
 )
 ```
 
-作答上下文只使用 result.evidence 中完整规则原文与规则 ID。选择题将选项放入 question，并在 instructions 中要求返回选项；问答题可以要求文字说明。
+作答上下文只使用 result.evidence 中完整规则原文与规则 ID。选择题将选项放入 question，并在 instructions 中要求返回选项；问答题可以要求文字说明。遍历验证集时复用 pipeline；Response 解析、标准答案比较和准确率计算由实验用例实现，不进入加载器或检索组件。
 
 ChatClient 只发送调用方 messages 并检查非空文本，不注入业务提示词、不强制 JSON、不解析业务响应。max_tokens、response_format 仅在显式传入时发送；SDK 错误原样抛出，超时与重试由 SDK 配置。
 
@@ -198,6 +265,6 @@ ChatClient 只发送调用方 messages 并检查非空文本，不注入业务�
 uv run pytest -q
 ```
 
-测试默认禁止真实网络，使用实际 BM25S、FAISS 和 SDK HTTP MockTransport。覆盖默认 800 条规则、整条规则与子规则共存、仅子规则索引、metadata、增强文本索引、原文重排、规则最高分聚合、规则级 Gate 和 Top-K、完整命中记录、缓存复用、显式重建、失败保留旧产物，以及问答题和选择题的完整实验调用。
+测试默认禁止真实网络，使用实际 BM25S、FAISS 和 SDK HTTP MockTransport。覆盖默认 800 条规则、规则与子规则、增强文本索引、原文重排、规则最高分聚合、规则级 Gate 和 Top-K、缓存和重建，以及 YAML 注册装配、共享模型、环境配置、相对路径、自定义注册组件、实验指令隔离和配置错误。
 
-正式双路产物由真实实验首次生成。调用方需提供 Embedding、Chat 客户端；使用 ZeroEntropy 重排时提供对应 SDK。pytest 的 mock 响应验证代码与调用契约，不替代真实模型链路验收。
+正式双路产物由真实实验首次生成。按 `.env.example` 配置实际模型服务后可以使用共享入口，也可以继续直接装配 SDK。pytest 的 mock 响应验证代码与调用契约，不替代真实模型链路验收。

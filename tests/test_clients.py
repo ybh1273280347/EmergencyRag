@@ -151,7 +151,7 @@ def test_api_errors_have_clear_boundary(candidate, client_kind):
                     EmbeddingClient(sdk, model="test-embedding").embed("问题")
             else:
                 with pytest.raises(AuthenticationError):
-                    ChatClient(sdk).complete(model="test", messages=[{"role": "user", "content": "问题"}])
+                    ChatClient(sdk, model="test").complete(messages=[{"role": "user", "content": "问题"}])
 
 
 @pytest.mark.parametrize("content,finish,error", [
@@ -175,12 +175,12 @@ def test_chat_returns_text_without_imposing_answer_format(content, finish, error
         })
 
     with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
-        chat = ChatClient(sdk)
+        chat = ChatClient(sdk, model="test-chat")
         if error:
             with pytest.raises(ValueError, match="empty"):
-                chat.complete(model="test-chat", messages=[{"role": "user", "content": "问题"}])
+                chat.complete(messages=[{"role": "user", "content": "问题"}])
         else:
-            assert chat.complete(model="test-chat", messages=[{"role": "user", "content": "问题"}]) == content
+            assert chat.complete(messages=[{"role": "user", "content": "问题"}]) == content
     assert calls == [{"model": "test-chat", "messages": [{"role": "user", "content": "问题"}]}]
 
 
@@ -196,8 +196,8 @@ def test_chat_forwards_explicit_output_options_without_parsing_json():
 
     messages = [{"role": "system", "content": "按指定格式作答"}, {"role": "user", "content": "问题"}]
     with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
-        result = ChatClient(sdk).complete(
-            model="test", messages=messages, max_tokens=128, response_format={"type": "json_object"},
+        result = ChatClient(sdk, model="test").complete(
+            messages=messages, max_tokens=128, response_format={"type": "json_object"},
         )
     assert result == "调用方负责解析"
     assert calls == [{"model": "test", "messages": messages, "max_tokens": 128, "response_format": {"type": "json_object"}}]
@@ -209,4 +209,4 @@ def test_chat_rejects_missing_choices():
     }))
     with OpenAI(api_key="test", http_client=httpx.Client(transport=transport)) as sdk:
         with pytest.raises(ValueError, match="empty"):
-            ChatClient(sdk).complete(model="test", messages=[{"role": "user", "content": "问题"}])
+            ChatClient(sdk, model="test").complete(messages=[{"role": "user", "content": "问题"}])

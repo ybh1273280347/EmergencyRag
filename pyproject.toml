@@ -14,6 +14,7 @@ dependencies = [
     "numpy>=1.26,<3",
     "openai>=1.60,<3",
     "pydantic>=2.10,<3",
+    "pyyaml>=6,<7",
     "zeroentropy>=0.1.0a11,<0.2",
 ]
 
