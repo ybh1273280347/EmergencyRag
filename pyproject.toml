@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Component-based emergency rule retrieval"
+requires-python = ">=3.11"
+dependencies = [
+    "bm25s>=0.2.14,<0.3",
+    "faiss-cpu>=1.10,<2",
+    "jieba>=0.42.1,<0.43",
+    "numpy>=1.26,<3",
+    "openai>=1.60,<3",
+    "pydantic>=2.10,<3",
+    "zeroentropy>=0.1.0a11,<0.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.27,<1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emergency_rag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# 仓库内隔离临时目录，避免 Windows 共享 TEMP 的残留权限影响测试。
+addopts = "-ra --basetemp=.pytest_cache/tmp"
+
+

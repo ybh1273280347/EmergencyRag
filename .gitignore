@@ -1,0 +1,14 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+!.env.example
+data/processed/
+data/indexes/
+data/.indexes-*/
+*.egg-info/
+dist/
+build/
