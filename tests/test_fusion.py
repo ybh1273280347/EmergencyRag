@@ -1,7 +1,7 @@
 import pytest
 
-from emergency_rag.retrieval.fusion.rrf import RRFFusion, RRFFusionConfig
-from emergency_rag.retrieval.fusion.union import UnionFusion, UnionFusionConfig
+from emergency_rag.retrieval.fusion.rrf import RRFFusion
+from emergency_rag.retrieval.fusion.union import UnionFusion
 
 
 def test_rrf_calculation_dedup_and_score_boundary(candidate):
@@ -20,7 +20,7 @@ def test_rrf_calculation_dedup_and_score_boundary(candidate):
 
 
 def test_rrf_total_budget(candidate):
-    results = RRFFusion(RRFFusionConfig(rank_constant=0, max_candidates=1)).fuse([
+    results = RRFFusion(k=0, top_k=1).fuse([
         [candidate("a"), candidate("b", rank=2)],
         [candidate("b", source="dense"), candidate("a", source="dense", rank=2)],
     ])
@@ -29,17 +29,17 @@ def test_rrf_total_budget(candidate):
     assert results[0].metadata["fusion"]["score"] == 1.5
 
 
-def test_union_source_budgets_before_dedup_and_no_refill(candidate):
+def test_union_preserves_all_retriever_results_and_observations(candidate):
     sparse = [candidate("a"), candidate("b", rank=2), candidate("c", rank=3)]
     dense = [candidate("a", "dense"), candidate("d", "dense", 2), candidate("e", "dense", 3)]
-    fusion = UnionFusion(UnionFusionConfig(per_source_top_k={"bm25": 2, "dense": 1}))
+    fusion = UnionFusion()
     results = fusion.fuse([sparse, dense])
-    assert [item.unit_id for item in results] == ["a", "b"]
+    assert [item.unit_id for item in results] == ["a", "b", "d", "c", "e"]
     assert results[0].sources == ["bm25", "dense"]
     assert len(results[0].metadata["retrieval"]) == 2
     assert "fusion" not in sparse[0].metadata
-    # 调换列表顺序不改变来源预算；每路仍只贡献其配置允许的前缀。
-    assert {item.unit_id for item in fusion.fuse([dense, sparse])} == {"a", "b"}
+    # 调换来源顺序只影响交替遍历顺序，不改变候选集合。
+    assert {item.unit_id for item in fusion.fuse([dense, sparse])} == {"a", "b", "c", "d", "e"}
 
 
 def test_union_no_total_limit_and_round_robin(candidate):
@@ -57,11 +57,9 @@ def test_union_overlap_example(candidate):
     assert len(UnionFusion().fuse([sparse, dense])) == 48
 
 
-def test_union_zero_budget_and_missing_source(candidate):
-    fusion = UnionFusion(UnionFusionConfig(per_source_top_k={"bm25": 0}))
-    assert fusion.fuse([[candidate("a")], []]) == []
-    with pytest.raises(ValueError, match="来源预算"):
-        fusion.fuse([[candidate("a", "dense")]])
+def test_union_preserves_more_than_default_retriever_budget(candidate):
+    candidates = [candidate(str(i), "custom", i + 1) for i in range(75)]
+    assert [item.unit_id for item in UnionFusion().fuse([[], candidates])] == [str(i) for i in range(75)]
 
 
 @pytest.mark.parametrize("fusion", [RRFFusion(), UnionFusion()])
@@ -82,22 +80,18 @@ def test_subqueries_keep_observations(candidate):
 
 
 def test_union_accepts_caller_defined_sources(candidate):
-    fusion = UnionFusion(UnionFusionConfig(per_source_top_k={"archive": 1, "lexical": 2}))
+    fusion = UnionFusion()
     results = fusion.fuse([
-        [candidate("a", "archive"), candidate("ignored", "archive", 2)],
+        [candidate("a", "archive"), candidate("c", "archive", 2)],
         [candidate("a", "lexical"), candidate("b", "lexical", 2)],
     ])
-    assert [item.unit_id for item in results] == ["a", "b"]
+    assert [item.unit_id for item in results] == ["a", "c", "b"]
     assert results[0].sources == ["archive", "lexical"]
 
 
-@pytest.mark.parametrize("config", [
-    RRFFusionConfig(rank_constant=-1), RRFFusionConfig(max_candidates=0),
-    UnionFusionConfig(per_source_top_k={"archive": -1}),
+@pytest.mark.parametrize("parameters", [
+    {"k": -1}, {"top_k": 0},
 ])
-def test_invalid_algorithm_budgets_fail_at_component_boundary(config):
+def test_invalid_algorithm_budgets_fail_at_component_boundary(parameters):
     with pytest.raises(ValueError):
-        if isinstance(config, RRFFusionConfig):
-            RRFFusion(config)
-        else:
-            UnionFusion(config)
+        RRFFusion(**parameters)

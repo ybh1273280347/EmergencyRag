@@ -1,4 +1,4 @@
-"""融合共享的候选去重：保留召回观察，不改写输入对象。"""
+"""融合内部共用的候选合并工具：保留召回观察，不改写输入对象。"""
 
 from emergency_rag.retrieval.models import Candidate
 

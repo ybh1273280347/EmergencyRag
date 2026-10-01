@@ -1,15 +1,7 @@
 """Embedding API 边界：批量、顺序恢复及响应校验，不拥有索引构建。"""
 
-from dataclasses import dataclass
-
 import numpy as np
 from openai import APIError, OpenAI
-
-
-@dataclass(frozen=True, slots=True)
-class EmbeddingClientConfig:
-    model: str
-    batch_size: int = 64
 
 
 class EmbeddingError(RuntimeError):
@@ -17,13 +9,13 @@ class EmbeddingError(RuntimeError):
 
 
 class EmbeddingClient:
-    def __init__(self, config: EmbeddingClientConfig, client: OpenAI) -> None:
-        if not config.model or not config.model.strip():
+    def __init__(self, client: OpenAI, *, model: str, batch_size: int = 64) -> None:
+        if not model or not model.strip():
             raise ValueError("Embedding 模型名未配置")
-        if config.batch_size <= 0:
+        if batch_size <= 0:
             raise ValueError("Embedding batch_size 必须为正整数")
-        self.model = config.model
-        self.config = config
+        self.model = model
+        self.batch_size = batch_size
         self.client = client
 
     def embed(self, text: str) -> np.ndarray:
@@ -37,8 +29,8 @@ class EmbeddingClient:
 
         batches: list[np.ndarray] = []
         dimension: int | None = None
-        for start in range(0, len(texts), self.config.batch_size):
-            batch = texts[start : start + self.config.batch_size]
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
             try:
                 response = self.client.embeddings.create(
                     model=self.model,
@@ -70,5 +62,6 @@ class EmbeddingClient:
                 raise EmbeddingError("Embedding 响应在不同批次间维度不一致")
             dimension = vectors.shape[1]
             batches.append(vectors)
+
         return np.ascontiguousarray(np.concatenate(batches), dtype=np.float32)
 

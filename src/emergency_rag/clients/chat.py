@@ -1,51 +1,38 @@
-"""Chat API 调用及 JSON object 输出边界，供后续语义组件使用。"""
+"""通用 Chat Completions 文本客户端，作答规则由调用方提供。"""
 
-import json
-from dataclasses import dataclass
-
-from openai import APIError, OpenAI
+from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
-
-@dataclass(frozen=True, slots=True)
-class ChatLLMConfig:
-    model: str
-    temperature: float = 0
+from openai.types.chat.completion_create_params import ResponseFormat
 
 
-class ChatLLMError(RuntimeError):
-    pass
+class ChatClient:
+    """只负责一次 Chat Completions 请求与文本响应边界校验。
 
+    业务提示词、结构化响应解析和请求节流属于调用用例。
+    超时与重试由注入的 SDK 客户端配置。
+    """
 
-class ChatLLM:
-    def __init__(self, config: ChatLLMConfig, client: OpenAI) -> None:
-        if not config.model or not config.model.strip():
-            raise ValueError("Chat 模型名未配置")
-        self.model = config.model
-        self.config = config
-        self.client = client
+    def __init__(self, client: OpenAI) -> None:
+        self._client = client
 
-    def invoke(self, messages: list[ChatCompletionMessageParam]) -> str:
-        if not messages:
-            raise ValueError("Chat messages 不能为空")
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "请仅输出一个合法的 JSON object。"},
-                    *messages,
-                ],
-                temperature=self.config.temperature,
-                response_format={"type": "json_object"},
-            )
-        except APIError as exc:
-            raise ChatLLMError(f"Chat API 调用失败：{type(exc).__name__}") from exc
-        if not response.choices or response.choices[0].finish_reason != "stop":
-            raise ChatLLMError("Chat 响应缺失、被截断或未正常结束")
+    def complete(
+        self,
+        *,
+        model: str,
+        messages: list[ChatCompletionMessageParam],
+        max_tokens: int | None = None,
+        response_format: ResponseFormat | None = None,
+    ) -> str:
+        request: dict[str, object] = {"model": model, "messages": messages}
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
+        if response_format is not None:
+            request["response_format"] = response_format
+
+        response = self._client.chat.completions.create(**request)
+        if not response.choices:
+            raise ValueError("chat completion response is empty")
         content = response.choices[0].message.content
-        try:
-            parsed = json.loads(content) if content else None
-        except json.JSONDecodeError as exc:
-            raise ChatLLMError("Chat 响应不是合法 JSON") from exc
-        if not isinstance(parsed, dict):
-            raise ChatLLMError("Chat 响应必须为 JSON object")
+        if not content or not content.strip():
+            raise ValueError("chat completion response is empty")
         return content

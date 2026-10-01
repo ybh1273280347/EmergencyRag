@@ -1,60 +1,37 @@
-from dataclasses import dataclass
-
 import faiss
+import numpy as np
 
 from emergency_rag.clients.embedding import EmbeddingClient
-from emergency_rag.data.models import SearchUnit
+from emergency_rag.data.models import IndexedDataset
 from emergency_rag.retrieval.models import Candidate
 
 from .base import Retriever
-from .vectors import normalize_vectors
-
-
-@dataclass(frozen=True, slots=True)
-class DenseRetrieverConfig:
-    top_k: int = 30
 
 
 class DenseRetriever(Retriever):
-    """查询调用方注入的向量索引和 Embedding 客户端。"""
+    """查询离线 FAISS 索引；在线只计算查询向量。"""
 
     name = "dense"
 
-    def __init__(
-        self,
-        index: faiss.IndexFlatIP,
-        unit_ids: list[str],
-        units: dict[str, SearchUnit],
-        embedding: EmbeddingClient,
-        config: DenseRetrieverConfig | None = None,
-    ) -> None:
-        self.index = index
-        self.unit_ids = unit_ids
-        self.units = units
+    def __init__(self, embedding: EmbeddingClient, *, top_k: int = 30) -> None:
         self.embedding = embedding
-        self.config = config or DenseRetrieverConfig()
-        if not isinstance(index, faiss.IndexFlatIP):
-            raise ValueError("Dense 索引必须为 FAISS IndexFlatIP")
-        if index.ntotal != len(unit_ids) or len(set(unit_ids)) != len(unit_ids):
-            raise ValueError("FAISS 行数与映射不匹配或存在重复 ID")
-        if any(unit_id not in units for unit_id in unit_ids):
-            raise ValueError("FAISS 映射包含知识库中不存在的 SearchUnit")
+        self.top_k = top_k
 
-    def retrieve(self, query: str, top_k: int | None = None) -> list[Candidate]:
-        limit = self.config.top_k if top_k is None else top_k
-        if type(limit) is not int or limit <= 0:
-            raise ValueError("top_k 必须为正整数")
-        if not self.unit_ids:
+    def retrieve(self, query: str, dataset: IndexedDataset) -> list[Candidate]:
+        index, unit_ids = dataset.load_dense()
+        if not unit_ids:
             return []
-        vector = normalize_vectors(self.embedding.embed(query)[None, :], dimension=self.index.d)
-        scores, rows = self.index.search(vector, min(limit, len(self.unit_ids)))
+        # 文档向量在离线构建时已归一化；在线只请求、归一化并搜索查询向量。
+        vector = np.ascontiguousarray(self.embedding.embed(query)[None, :], dtype=np.float32)
+        faiss.normalize_L2(vector)
+        scores, rows = index.search(vector, min(self.top_k, len(unit_ids)))
         ranked = sorted(
             zip(rows[0], scores[0]),
-            key=lambda item: (-float(item[1]), self.unit_ids[int(item[0])]),
+            key=lambda item: (-float(item[1]), unit_ids[int(item[0])]),
         )
         candidates = []
         for rank, (row, score) in enumerate(ranked, start=1):
-            unit = self.units[self.unit_ids[int(row)]]
+            unit = dataset.units[unit_ids[int(row)]]
             candidates.append(
                 Candidate(
                     unit_id=unit.unit_id,

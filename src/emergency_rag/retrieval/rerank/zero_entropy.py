@@ -1,7 +1,6 @@
 """ZeroEntropy 边界：完整评分、批内身份映射、排序，不拥有候选预算。"""
 
 import math
-from dataclasses import dataclass
 from xml.sax.saxutils import escape
 
 from zeroentropy import APIError, ZeroEntropy
@@ -14,31 +13,18 @@ class ZeroEntropyRerankerError(RuntimeError):
     pass
 
 
-_RELEVANCE_INSTRUCTION = (
-    "Evaluate relevance to the information need expressed by the query. "
-    "The query may be a question, statement, topic, or phrase. "
-    "A document is relevant when it provides useful context for that information need, "
-    "even if it does not directly answer a question."
-)
-
-
-@dataclass(frozen=True, slots=True)
-class ZeroEntropyRerankerConfig:
-    model: str
-    batch_size: int = 64  # 请求拆分大小，不是候选数量上限
-    instruction: str | None = _RELEVANCE_INSTRUCTION
-
-
 class ZeroEntropyReranker(Reranker):
     name = "zeroentropy"
 
-    def __init__(self, config: ZeroEntropyRerankerConfig, client: ZeroEntropy) -> None:
-        if not config.model or not config.model.strip():
+    def __init__(self, client: ZeroEntropy, *, model: str, instruction: str, batch_size: int = 64) -> None:
+        if not model or not model.strip():
             raise ValueError("ZeroEntropy 模型名未配置")
-        if config.batch_size <= 0:
+        if batch_size <= 0:
             raise ValueError("ZeroEntropy batch_size 必须为正整数")
-        self.model = config.model
-        self.config = config
+        self.model = model
+        # 请求拆分大小，不是候选数量上限。
+        self.batch_size = batch_size
+        self.instruction = instruction
         self.client = client
 
     def rerank(self, query: str, candidates: list[Candidate]) -> list[Candidate]:
@@ -47,14 +33,14 @@ class ZeroEntropyReranker(Reranker):
         if len({item.unit_id for item in candidates}) != len(candidates):
             raise ValueError("重排输入包含重复 unit_id")
         provider_query = query
-        if self.config.instruction:
+        if self.instruction:
             provider_query = (
                 f"<query>{escape(query)}</query>"
-                f"<instruction>{escape(self.config.instruction)}</instruction>"
+                f"<instruction>{escape(self.instruction)}</instruction>"
             )
         ranked: list[Candidate] = []
-        for start in range(0, len(candidates), self.config.batch_size):
-            batch = candidates[start : start + self.config.batch_size]
+        for start in range(0, len(candidates), self.batch_size):
+            batch = candidates[start : start + self.batch_size]
             try:
                 response = self.client.models.rerank(
                     model=self.model,
@@ -85,4 +71,5 @@ class ZeroEntropyReranker(Reranker):
                 candidate.final_score = score
                 candidate.metadata["rerank"] = {"model": self.model}
                 ranked.append(candidate)
+
         return sorted(ranked, key=lambda item: (-item.final_score, item.unit_id))

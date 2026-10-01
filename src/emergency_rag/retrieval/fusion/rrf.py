@@ -1,14 +1,7 @@
-from dataclasses import dataclass
 from emergency_rag.retrieval.models import Candidate
 
 from .base import Fusion
-from .merge import merge_candidate
-
-
-@dataclass(frozen=True, slots=True)
-class RRFFusionConfig:
-    rank_constant: int = 60
-    max_candidates: int = 60  # 融合排序后的总上限
+from .utils.merge import merge_candidate
 
 
 class RRFFusion(Fusion):
@@ -16,12 +9,13 @@ class RRFFusion(Fusion):
 
     name = "rrf"
 
-    def __init__(self, config: RRFFusionConfig | None = None) -> None:
-        self.config = config or RRFFusionConfig()
-        if type(self.config.rank_constant) is not int or self.config.rank_constant < 0:
-            raise ValueError("RRF rank_constant 必须为非负整数")
-        if type(self.config.max_candidates) is not int or self.config.max_candidates <= 0:
-            raise ValueError("RRF max_candidates 必须为正整数")
+    def __init__(self, *, k: int = 60, top_k: int = 60) -> None:
+        if  k < 0:
+            raise ValueError("RRF k 必须为非负整数")
+        if top_k <= 0:
+            raise ValueError("RRF top_k 必须为正整数")
+        self.k = k
+        self.top_k = top_k
 
     def fuse(self, result_sets: list[list[Candidate]]) -> list[Candidate]:
         merged: dict[str, Candidate] = {}
@@ -36,7 +30,7 @@ class RRFFusion(Fusion):
                 seen.add(candidate.unit_id)
                 scores[candidate.unit_id] = (
                     scores.get(candidate.unit_id, 0.0)
-                    + 1.0 / (self.config.rank_constant + rank)
+                    + 1.0 / (self.k + rank)
                 )
         ordered = sorted(merged.values(), key=lambda item: (-scores[item.unit_id], item.unit_id))
         for rank, candidate in enumerate(ordered, start=1):
@@ -45,4 +39,4 @@ class RRFFusion(Fusion):
                 "rank": rank,
                 "score": scores[candidate.unit_id],
             }
-        return ordered[: self.config.max_candidates]
+        return ordered[: self.top_k]

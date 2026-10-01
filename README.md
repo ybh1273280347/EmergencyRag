@@ -1,207 +1,211 @@
 # Emergency-RAG Retrieval Core
 
-可直接装配的同步检索组件库。各阶段使用独立 ABC，各具体组件在自身模块定义 `dataclass(frozen=True, slots=True)` Config。调用方负责准备数据、索引和模型 SDK，并直接构造 `RetrievalPipeline`。
+规则知识库的同步检索组件库。原始数据通过 Chunker 生成 SearchUnits，离线构建数据集目录，再初始化检索组件并直接查询。最终候选由调用方传给作答模型。切换初赛或复赛数据集时，调用方只需更换目录。
 
-库没有 CLI、YAML、全局 Settings、通用 Factory 或组件注册表。Pipeline 通过阶段接口执行，不限定检索器来源、Fusion 类型或 Reranker 类型。现有 BM25、Dense、RRF、Union、ZeroEntropy 是可选实现。
+各阶段使用独立 ABC。当前组件的参数都较简单，直接通过构造函数注入。Pipeline 是 dataclass，调用方直接选择并注入 Retriever、Fusion、Reranker 等组件。
 
-## 安装与测试
+src 中的 DatasetPipeline 把读取规则、可插拔 Chunker、双路索引构建和 IndexedDataset 加载串成一条流水线。开始处理之前先确定目录，已有目录直接加载；目录缺失时才读取规则并构建。读取与流程放在 data/pipeline.py，索引构建放在 data/indexing.py。
 
-Python 3.11+，在仓库根目录执行：
+## 数据集目录
 
-```powershell
-uv sync --group dev
-uv run pytest -q
+```text
+data/indexes/
+  preliminary-rule-jieba/
+    units.json                 完整知识单元快照
+    index_meta.json            构建说明，在线不依赖
+    bm25/
+      ...                      BM25S 矩阵、参数及词表
+      unit_ids.json            索引行对应的 unit_id
+    dense/
+      faiss.index              离线生成的单位向量 IndexFlatIP
+      faiss_mapping.json       索引行对应的 unit_id
+      index_meta.json          Dense 构建说明
+  preliminary-sentence-jieba/  使用 sentence 分块策略、jieba 分词器的初赛产物
+  preliminary-rule-characters/ 使用 rule 分块策略、characters 分词器的初赛产物
+  semifinal-rule-jieba/        使用 rule 分块策略、jieba 分词器的复赛产物
 ```
+
+完整构建入口始终生成 BM25 和 Dense，每个数据集目录的知识单元和两路索引由同一次离线构建生成。在线 Pipeline 仍由调用方选择检索组件，可只使用其中一路。
+
+IndexedDataset 保存知识单元快照和准备流水线使用的 tokenizer，加载时一次性读取目录中已有的索引、词表和映射并缓存，供多个检索器共用。BM25 从 Dataset 取得分词器，不接受独立 tokenizer 参数。查询时使用已经加载的对象，不读取索引文件，不重建索引。units.json 是该次索引对应的知识单元快照，无需额外数据库中转。
+
+通常由 DatasetPipeline.prepare 返回 IndexedDataset，再将对象注入 RetrievalPipeline。Pipeline 向所有检索器统一传递同一份 Dataset，不需要实验代码逐个绑定数据集、判断目录、手动分块或拼接索引路径。
+
+初赛目录的检索语料是 `datasets/初赛规则集rules1.json` 中的 800 条规则；`datasets/初赛验证集dev.json` 提供 500 条查询，用于验证检索结果。
 
 ## 调用方直接装配
 
-下面的 `bm25_index`、`bm25_tokenizer`、`unit_ids`、`units_by_id` 都是应用已经准备好的对象。SDK 客户端也由应用创建和关闭，密钥、地址、超时、重试使用应用自己的配置。组件不读取环境变量。
-
-```python
-from zeroentropy import ZeroEntropy
-
-from emergency_rag.retrieval.fusion.rrf import RRFFusion, RRFFusionConfig
-from emergency_rag.retrieval.pipeline import RetrievalPipeline, RetrievalPipelineConfig
-from emergency_rag.retrieval.rerank.zero_entropy import (
-    ZeroEntropyReranker,
-    ZeroEntropyRerankerConfig,
-)
-from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever, BM25RetrieverConfig
-
-with ZeroEntropy(
-    api_key=settings.ZERO_ENTROPY_API_KEY,
-    timeout=60,
-    max_retries=2,
-) as rerank_client:
-    pipeline = RetrievalPipeline(
-        retrievers=(
-            BM25Retriever(
-                index=bm25_index,
-                tokenizer=bm25_tokenizer,
-                unit_ids=unit_ids,
-                units=units_by_id,
-                config=BM25RetrieverConfig(top_k=30),
-            ),
-        ),
-        fusion=RRFFusion(RRFFusionConfig(max_candidates=30)),
-        reranker=ZeroEntropyReranker(
-            client=rerank_client,
-            config=ZeroEntropyRerankerConfig(model=settings.RERANKER_MODEL),
-        ),
-        config=RetrievalPipelineConfig(final_top_k=10),
-    )
-    result = pipeline.retrieve("危险化学品事故应急结束条件", top_k=10)
-    print(result.model_dump_json(indent=2))
-```
-
-`settings` 属于调用方应用，库不提供或要求这种配置对象。完整的有类型装配函数见 [examples/assemble_pipeline.py](examples/assemble_pipeline.py)。此示例只选择 BM25；选择 Dense、自定义 Retriever、其他 Fusion 或其他 Reranker 时，直接改变调用方传入的实例即可。
-
-```python
-pipeline = RetrievalPipeline(
-    retrievers=(archive_retriever, dense_retriever, custom_retriever),
-    fusion=my_fusion,
-    reranker=my_reranker,
-    gate=my_gate,
-)
-```
-
-扩展组件只需继承相应阶段的 ABC，实现该阶段的方法并提供名称，无需注册、枚举策略或修改 Pipeline。
-
-QueryProcessor、CandidateExpander、CandidateGate、EvidenceProjector 基类直接提供原样返回的默认实现。构造 Pipeline 时这些参数默认为 `None`，表示使用基类默认行为。Chunker、Retriever、Fusion、Reranker 和 TextTokenizer 需要具体算法实现。
-
-## 已准备数据的使用
-
-SQLite 和索引在应用初始化处读取一次，然后复用内存中的对象。Retriever 构造与查询都不加载文件，不访问 SQLite，也没有 `load()` 方法。若应用已经持有构建返回的资源，可以直接注入，完全不经过文件。
-
-已有 BM25 产物可按以下方式在调用方初始化处读取；这是普通显式读取，不属于 Pipeline 或 Retriever 的职责：
-
 ```python
 from pathlib import Path
-from pydantic import TypeAdapter
 
-from emergency_rag.data.repository import RuleRepository
-from emergency_rag.retrieval.retrievers.bm25_backend import Tokenizer, bm25s
+from emergency_rag.data.pipeline import DatasetPipeline
+from emergency_rag.retrieval.fusion.rrf import RRFFusion
+from emergency_rag.retrieval.pipeline import RetrievalPipeline
+from emergency_rag.retrieval.rerank.base import Reranker
+from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
 
-units = RuleRepository(Path("data/processed/emergency.db")).load_search_units()
-units_by_id = {unit.unit_id: unit for unit in units}
-directory = Path("data/indexes/bm25")
-bm25_index = bm25s.BM25.load(str(directory), load_corpus=False)
-bm25_tokenizer = Tokenizer(splitter=JiebaTokenizer().tokenize, stopwords=[], stemmer=None)
-bm25_tokenizer.load_vocab(str(directory))
-unit_ids = TypeAdapter(list[str]).validate_json(
-    (directory / "unit_ids.json").read_text(encoding="utf-8"),
+# 根据数据集、分块策略和分词策略自动构建或复用目录。
+dataset = DatasetPipeline(
+    embedding=embedding_client,
+    tokenizer=JiebaTokenizer(),
+).prepare(
+    Path("datasets/初赛规则集rules1.json"), dataset_name="preliminary",
 )
+pipeline = RetrievalPipeline(
+    dataset=dataset,
+    retrievers=(
+        BM25Retriever(
+            top_k=30,
+        ),
+    ),
+    fusion=RRFFusion(top_k=30),
+    reranker=Reranker(),
+)
+result = pipeline.retrieve("危险化学品事故应急结束条件", top_k=10)
 ```
 
-FAISS 也直接使用调用方已有的 `IndexFlatIP`、行映射及知识单元。Windows Unicode 文件路径可通过读取序列化字节处理：
+Pipeline 接口是 `retrieve(query, top_k=10)`。Reranker 默认原样返回，省略 reranker 参数也使用这一行为，方便检索测试；需要模型评分时可直接注入 ZeroEntropyReranker。一次完整实验见 [examples/preliminary_experiment.py](examples/preliminary_experiment.py)，包含 Dataset 准备、组件装配、检索和模型作答。
+
+需要 Dense 召回时，选择对应组件加入 retrievers：
 
 ```python
-import faiss
-import numpy as np
+from emergency_rag.retrieval.retrievers.dense import DenseRetriever
 
-from emergency_rag.clients.embedding import EmbeddingClient, EmbeddingClientConfig
-from emergency_rag.retrieval.retrievers.dense import DenseRetriever, DenseRetrieverConfig
-
-# embedding_sdk 是应用创建的 OpenAI SDK 客户端。
-embedding = EmbeddingClient(
-    client=embedding_sdk,
-    config=EmbeddingClientConfig(model=settings.EMBEDDING_MODEL),
+dense = DenseRetriever(
+    embedding=embedding_client,
+    top_k=30,
 )
-directory = Path("data/indexes")
-dense_index = faiss.deserialize_index(
-    np.frombuffer((directory / "faiss.index").read_bytes(), dtype="uint8"),
-)
-dense_ids = TypeAdapter(list[str]).validate_json(
-    (directory / "faiss_mapping.json").read_text(encoding="utf-8"),
-)
-dense_retriever = DenseRetriever(
-    index=dense_index,
-    unit_ids=dense_ids,
-    units=units_by_id,
-    embedding=embedding,
-    config=DenseRetrieverConfig(top_k=30),
-)
+candidates = dense.retrieve(query, dataset)
 ```
 
-已有 SQLite、BM25S、FAISS 和映射格式继续可用。Retriever 只检查注入索引的行数、映射和可解析的知识单元，不读取构建说明、不比较数据库全库顺序、不计算语料指纹。
+Dense 在线只调用一次查询 embedding，然后归一化并搜索已加载的 FAISS 索引；文档 embedding 在离线构建时计算。在线与离线应使用相同的 embedding 模型。BM25 的查询分词器从 Dataset 取得，与离线构建使用同一个 TextTokenizer 实例。
+
+Dataset 注入 Pipeline；Retriever 构造函数只接收自身参数与模型依赖，统一接口为 retrieve(query, dataset)。同一个 Retriever 可以用于不同 Pipeline，数据和索引资源由各自的 Dataset 持有。模型地址、密钥、超时和重试由调用方创建 SDK 时配置；模型名、批大小和重排指令直接传给组件构造函数。例如 EmbeddingClient(embedding_sdk, model=embedding_model, batch_size=64)。`.env.example` 是可选的应用环境配置参考，库不读取环境变量。
 
 ## 离线构建
 
-`scripts` 提供普通 Python 函数，没有命令行参数解析，也不创建 SDK 或读取应用配置。BM25、Dense 的构建和保存分别调用，不要求同时存在两路索引。
+Python 3.11+，使用 uv 管理依赖：
+
+```powershell
+uv sync --group dev
+```
+
+调用方选择 Chunker，准备一次数据集，然后直接装配检索组件：
 
 ```python
 from pathlib import Path
 
-from scripts.prepare_rules import prepare_rules
-from scripts.build_indexes import (
-    build_bm25_index, build_dense_index,
-    save_bm25_index, save_dense_index,
-)
+from emergency_rag.data.pipeline import DatasetPipeline
+from emergency_rag.chunking.rule import RuleChunker
+from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
 
-# 已有数据库可以直接用；仅初次准备或显式重建时调用。
-prepare_rules(
+# embedding_client 由应用创建，也可供后续 DenseRetriever 使用。
+preparation = DatasetPipeline(
+    index_root=Path("data/indexes"),
+    chunker=RuleChunker(),
+    tokenizer=JiebaTokenizer(),
+    embedding=embedding_client,
+)
+dataset = preparation.prepare(
     Path("datasets/初赛规则集rules1.json"),
-    Path("data/processed/emergency.db"),
-    overwrite=True,
+    dataset_name="preliminary",
 )
-units = RuleRepository(Path("data/processed/emergency.db")).load_search_units()
-
-bm25_index, bm25_tokenizer, unit_ids = build_bm25_index(units, JiebaTokenizer())
-# 构建返回值可直接注入 BM25Retriever；保存是可选的独立操作。
-save_bm25_index(bm25_index, bm25_tokenizer, unit_ids, Path("data/indexes/bm25"), overwrite=True)
-
-# 使用调用方已经创建的 embedding；只使用 BM25 时不执行以下代码。
-dense_index, dense_ids = build_dense_index(units, embedding)
-save_dense_index(
-    dense_index, dense_ids, Path("data/indexes/dense"),
-    embedding_model=embedding.model, overwrite=True,
-)
+# 目录为 data/indexes/preliminary-rule-jieba；存在时直接加载，不调用 embedding。
+sparse = BM25Retriever()
+dense = DenseRetriever(embedding=embedding_client)
+# 接着由调用方选择 fusion、reranker 等，装配 RetrievalPipeline。
+# Dataset 只在 RetrievalPipeline(dataset=dataset, ...) 注入一次。
 ```
 
-目录路径由调用方指定。示例将 Dense 放在独立目录，避免替换 Dense 产物时覆盖 BM25；已有的 `data/indexes/faiss.index` 仍可直接读取。数据库使用事务，重复 ID、非法格式和空白文本会拒绝入库。保存索引完成全部临时写入才替换目标目录，失败保留旧产物。`overwrite` 默认为 `False`。
+DatasetPipeline 使用默认 RuleChunker、JiebaTokenizer 和 data/indexes 根目录，也支持显式注入。embedding 是双路构建所需依赖。prepare 始终返回 IndexedDataset，流程如下：
 
-## 生命周期和预算
+1. 根据 dataset_name、chunker.name 和 tokenizer.name 确定目录。
+2. 目录存在时直接加载并携带当前 tokenizer，跳过原始文件读取、分块及文档 embedding。
+3. 目录不存在时读取规则、分块，用当前 tokenizer 构建 BM25，同时构建 Dense，再将同一 tokenizer 随 IndexedDataset 返回。
+
+需要重建时显式传入 `overwrite=True`。知识单元和两路索引先写入临时目录，整体成功后才替换目标；模型或写入失败保留旧目录。已有目录读取失败直接报错，不自动重建或覆盖。
+
+DatasetPipeline 直接读取规则并调用 Chunker，保留其产生的 metadata，并加入：
+
+```python
+{"dataset": "preliminary", "chunker": {"strategy": "rule"}}
+```
+
+目录名称为 `<dataset>-<chunker>-<tokenizer>`，不再单独传入目录名。准备流水线在读取源文件前用 dataset_name、chunker.name 和 tokenizer.name 定位目录；生成 units 后将数据集与分块信息写入 metadata，构建入口结合 tokenizer.name 按同一规则确定路径。使用 preliminary 表示初赛，semifinal 表示复赛；名称使用小写英文，可包含数字和连字符。例如不同窗口实验可分别使用 window-256、window-512。同批 units 必须来自同一数据集和分块策略，构建入口在写入前检查这些来源字段。index_meta.json 记录使用的 tokenizer 策略名，在线仍不依赖该构建说明启动。
+
+数据格式、重复 ID、空白文本由原始数据处理和离线构建检查，文档向量的有效性、数量及归一化由离线构建负责。加载目录使用普通文件读取，不做语料指纹、模型地址或全库顺序审计。构建说明不影响启动或查询。
+
+data 保留三个文件：models.py 定义 Rule、SearchUnit、IndexedDataset，并提供 Dataset 的索引加载与目录命名；pipeline.py 包含原始规则读取和 DatasetPipeline；indexing.py 构建并保存索引。DatasetPipeline 直接执行读取、分块和来源 metadata 写入。需要单独分块时可直接调用 chunker.chunk(read_rules(source))。旧离线脚本已删除，实验直接使用 DatasetPipeline，无需单独执行构建脚本。
+
+融合共用的候选合并工具位于 retrieval/fusion/utils/merge.py，由 RRF 和 Union 调用。
+
+缓存复用只依据目录存在。更换分词器名称会自动使用另一个目录。不同分块参数或分词配置的实验应提供不同 name；在同名目录下更换原始数据、分词参数或 embedding 模型时，需要显式 overwrite。
+
+## 生命周期与独立预算
 
 ```text
-QueryProcessor.process
-→ 各 Retriever.retrieve
-→ Fusion.fuse
-→ CandidateExpander.expand
-→ Reranker.rerank
-→ CandidateGate.filter
-→ EvidenceProjector.project
-→ 最终 Top-K、连续 final_rank
-→ RetrievalResult
+QueryProcessor
+→ 各 Retriever.retrieve(query, pipeline.dataset)
+→ Fusion
+→ Expansion
+→ Reranker
+→ Gate
+→ Top-K 截断
+→ Projector
+→ 连续 final_rank 与 RetrievalResult
 ```
 
-| 所属 Config | 参数与默认值 | 作用 |
-|---|---|---|
-| BM25RetrieverConfig | top_k=30；k1=1.5、b=0.75 | 召回预算；k1/b 用于离线构建 |
-| DenseRetrieverConfig | top_k=30 | Dense 召回预算 |
-| RRFFusionConfig | rank_constant=60；max_candidates=60 | RRF 常数及融合后总上限 |
-| UnionFusionConfig | per_source_top_k={bm25:30,dense:30} | 各来源去重前的预算，可配置任意来源名 |
-| EmbeddingClientConfig | model；batch_size=64 | Embedding 模型及请求拆分 |
-| ZeroEntropyRerankerConfig | model；batch_size=64；instruction | 重排模型、请求拆分及相关性指令 |
-| ChatLLMConfig | model；temperature=0 | 独立 Chat JSON 客户端 |
-| RetrievalPipelineConfig | final_top_k=10 | 投影后的最终数量 |
+Retriever 的 top_k 在初始化时指定，retrieve 不接收覆盖参数。Pipeline 的 top_k 只截断通过 Gate 的有序候选，不改变召回、融合或重排数量。
 
-Pipeline 调用 `retriever.retrieve(query)`，预算由各 Retriever 拥有；显式调用 `retriever.retrieve(query, top_k=...)` 只覆盖本次召回。`Fusion.fuse(result_sets)` 不接收公共预算。`pipeline.retrieve(query, top_k=...)` 只影响最终返回数量。
+| 所属组件                  | 参数及默认值                        | 作用                             |
+| ------------------------- | ----------------------------------- | -------------------------------- |
+| BM25Retriever             | top_k=30                            | BM25 召回数量                    |
+| DenseRetriever            | top_k=30                            | Dense 召回数量                   |
+| RRFFusion                 | k=60；top_k=60                      | RRF 常数及融合后总上限           |
+| UnionFusion               | 无配置                              | 交替合并全部召回结果并去重        |
+| EmbeddingClient           | model；batch_size=64                | 模型与请求拆分                   |
+| ZeroEntropyReranker       | model；instruction；batch_size=64   | 模型、相关性指令和请求拆分       |
+| Reranker                  | 无参数                              | 默认保持候选顺序与分数           |
+| ChatClient.complete       | model；messages；可选输出参数       | 通用文本请求，作答格式由调用方决定 |
+| Pipeline.retrieve         | top_k=10                            | Gate 后有序候选的截断数量        |
 
-RRF 使用 `Σ 1/(rank_constant + rank)`，同一结果集重复单元只计一次，排序后按自身总预算截断，平分按 unit_id 排序。Union 每路先取配置前缀，再交替合并去重，不比较不同召回分数，不补齐重叠候选，不施加总上限。两路各 30 条、重叠 12 条时，Union 输出 48 条。
+RRF 去重计分后按总预算截断。Union 忠实使用各检索器已经排好的全部结果，交替合并去重，不重新排序或截断。每路数量由检索器初始化参数决定；两路各返回 30 条、重叠 12 条时输出 48 条。
 
-## 分数和错误边界
+QueryContext 保存 original_query、可选的 rewritten_query 和 sub_queries。queries 属性返回主查询与子查询列表，主查询优先使用 rewritten_query，未改写时使用 original_query。Pipeline 对该列表执行召回，重排仍使用 original_query。
 
-召回和融合不写 `Candidate.final_score`；它只承载重排相关性分数。`metadata["retrieval"]` 保留各来源的查询、原始排名和分数；`metadata["fusion"]` 保留融合排名及分数。排名从 1 开始，最终截断发生在 Projector 之后。
+召回与融合不写 final_score。各路查询、原始得分和排名保存在 metadata.retrieval，融合信息保存在 metadata.fusion。默认 Reranker 原样返回输入列表，不排序、不打分，检索结果保留融合顺序；ZeroEntropyReranker 完整打分排序，final_score 只承载重排相关性分数。返回 metadata 包含总耗时、各路召回数量、融合及最终数量和启用组件名称。
 
-ZeroEntropy 按批内 index 恢复候选，完整打分排序，拒绝缺失、重复、越界 index 及非有限或 [0,1] 外分数。Embedding 恢复响应顺序并返回 float32；Dense 在文档构建及查询时 L2 Normalize，拒绝零向量、非有限数值和维度不匹配。超时和重试由应用创建的 SDK 处理，Pipeline 不叠加重试。
+默认阶段由其 ABC 提供原样返回行为，使用 Pipeline 字段的 default_factory 创建。Pipeline 没有 Config 或手写 __init__。自定义 Retriever、Fusion、Reranker、Gate 等实现可直接注入，无需注册；库没有 CLI、YAML、全局 Settings 或通用 Factory。
 
-返回 metadata 包含总耗时、各路召回数量、融合与最终数量，以及启用的检索器、融合器、重排器名称。
+## 检索结果用于作答
 
-## 当前验收状态
+完整调用顺序为：DatasetPipeline（已有目录直接加载，或读取规则 → Chunker → SearchUnits → 离线双路索引）→ IndexedDataset → RetrievalPipeline（向各路传递同一 Dataset）→ 最终候选 → 作答模型。RetrievalPipeline 返回 RetrievalResult；模型作答由调用方用例执行，不加入检索阶段。
 
-800 条初赛规则已写入 `data/processed/emergency.db`，一条 Rule 对应一条 SearchUnit，保留原文。已有 BM25 索引在 `data/indexes/bm25`，可直接复用。本轮不会因架构调整重建已有产物。
+```python
+from emergency_rag.clients.chat import ChatClient
+from examples.preliminary_experiment import run_experiment
 
-测试使用真实 SQLite、BM25S、FAISS 和模型 SDK HTTP MockTransport，默认禁止网络。覆盖调用方装配、自定义组件、None 默认阶段、独立预算、索引保存及恢复、查询不访问数据文件、模型响应对齐及失败回滚。
+result, answer = run_experiment(
+    embedding=embedding_client,
+    chat=ChatClient(chat_sdk),
+    chat_model=chat_model,
+    question="危险化学品事故应急结束需要满足哪些条件？",
+    instructions="请根据参考规则回答问题，并注明规则编号。",
+    top_k=10,
+)
+```
 
-真实 Embedding 索引和 ZeroEntropy 端到端验收仍待调用方提供远程模型客户端；mock 测试不替代该验收。本阶段不实现答案生成或统一评测。
+[examples/preliminary_experiment.py](examples/preliminary_experiment.py) 是 examples 中唯一的实验。Chunker、Tokenizer、Retriever、Fusion 和 Reranker 的选择集中在实验函数中；执行后直接返回检索结果与答案。Dataset 自动构建或复用，最终候选文本和规则 ID 作为参考资料交给模型。选择题可把选项放入 question，并在 instructions 中要求返回选项；问答题可要求文字说明。
+
+ChatClient 仅发送原样 messages 并检查返回文本非空，不注入提示词、不强制 JSON、不解析业务响应。complete 的 model、messages 由本次调用指定，max_tokens 和 response_format 仅在显式传入时发送。需要结构化答案时，调用方指定 response_format 并解析返回文本。SDK 错误原样抛出，重试与超时由调用方创建 SDK 时配置。
+
+## 验证与当前产物
+
+```powershell
+uv run pytest -q
+```
+
+测试默认禁止网络，使用真实 BM25S、FAISS 和 SDK HTTP MockTransport。覆盖缓存命中跳过离线处理、缺失时自动构建、显式重建、缓存读取失败直接报错、可替换分块器、Tokenizer 随 Dataset 传递、不同 Tokenizer 的目录隔离、来源 metadata、确定性目录名、双路构建、混合来源拒绝、目录切换、保存与加载一致性、查询不读文件或建索引、Dense 只计算查询向量、独立预算、模型响应对齐、构建失败保留旧目录及最终候选交给作答模型。
+
+旧 BM25 索引、旧 preliminary 目录和旧验证报告已删除。首次实验将按当前 Chunker 和 Tokenizer 在 data/indexes/preliminary-rule-jieba 自动生成完整双路产物，后续复用该目录。真实模型实验需要调用方提供 Embedding 和 Chat 客户端；使用 ZeroEntropy 重排时再配置对应客户端。pytest 使用 mock 响应验证链路，不替代真实模型验收。

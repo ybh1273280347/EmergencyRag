@@ -1,9 +1,11 @@
-"""在线阶段编排；召回与融合预算均由具体组件拥有。"""
+"""在线阶段编排；组件由调用方注入，默认阶段由其 ABC 提供。"""
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
+
+from emergency_rag.data.models import IndexedDataset
 
 from .expansion.base import CandidateExpander
 from .fusion.base import Fusion
@@ -17,39 +19,22 @@ from .retrievers.base import Retriever
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class RetrievalPipelineConfig:
-    final_top_k: int = 10
-
-
+@dataclass(slots=True)
 class RetrievalPipeline:
-    def __init__(
-        self,
-        *,
-        retrievers: Sequence[Retriever],
-        fusion: Fusion,
-        reranker: Reranker,
-        query_processor: QueryProcessor | None = None,
-        expander: CandidateExpander | None = None,
-        gate: CandidateGate | None = None,
-        projector: EvidenceProjector | None = None,
-        config: RetrievalPipelineConfig | None = None,
-    ) -> None:
-        # None 表示使用该阶段基类的默认实现，不跳过生命周期阶段。
-        self.query_processor = QueryProcessor() if query_processor is None else query_processor
-        self.retrievers = retrievers
-        self.fusion = fusion
-        self.expander = CandidateExpander() if expander is None else expander
-        self.reranker = reranker
-        self.gate = CandidateGate() if gate is None else gate
-        self.projector = EvidenceProjector() if projector is None else projector
-        self.config = config or RetrievalPipelineConfig()
+    dataset: IndexedDataset
+    retrievers: Sequence[Retriever]
+    fusion: Fusion
+    # 未显式传入时使用 ABC 默认行为，每个 Pipeline 持有独立的阶段实例。
+    query_processor: QueryProcessor = field(default_factory=QueryProcessor)
+    reranker: Reranker = field(default_factory=Reranker)
+    expander: CandidateExpander = field(default_factory=CandidateExpander)
+    gate: CandidateGate = field(default_factory=CandidateGate)
+    projector: EvidenceProjector = field(default_factory=EvidenceProjector)
 
-    def retrieve(self, query: str, top_k: int | None = None) -> RetrievalResult:
+    def retrieve(self, query: str, top_k: int = 10) -> RetrievalResult:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query 必须为非空文本")
-        limit = self.config.final_top_k if top_k is None else top_k
-        if type(limit) is not int or limit <= 0:
+        if type(top_k) is not int or top_k <= 0:
             raise ValueError("top_k 必须为正整数")
         started = perf_counter()
         query_ctx = self.query_processor.process(query)
@@ -58,7 +43,7 @@ class RetrievalPipeline:
         retrieval_counts: dict[str, int] = {}
         for subquery in query_ctx.queries:
             for retriever in self.retrievers:
-                result_set = retriever.retrieve(subquery)
+                result_set = retriever.retrieve(subquery, self.dataset)
                 result_sets.append(result_set)
                 retrieval_counts[retriever.name] = retrieval_counts.get(retriever.name, 0) + len(result_set)
 
@@ -66,13 +51,12 @@ class RetrievalPipeline:
         fusion_count = len(candidates)
         candidates = self.expander.expand(query_ctx, candidates)
         candidates = self.reranker.rerank(query_ctx.original_query, candidates)
-        candidates = self.gate.filter(query_ctx, candidates)
-        candidates = self.projector.project(candidates)
-
-        # 最终预算在投影之后消耗；重排器对输入的完整候选集评分。
+        candidates = self.gate.filter(candidates)
+        # 最终 Top-K 只截断通过 Gate 的有序候选，不改变任何组件的预算。
+        candidates = self.projector.project(candidates[:top_k])
         candidates = [
             candidate.model_copy(update={"final_rank": rank})
-            for rank, candidate in enumerate(candidates[:limit], start=1)
+            for rank, candidate in enumerate(candidates, start=1)
         ]
         latency_ms = (perf_counter() - started) * 1000
         logger.info("检索完成 fusion=%s candidates=%d latency_ms=%.2f", self.fusion.name, len(candidates), latency_ms)

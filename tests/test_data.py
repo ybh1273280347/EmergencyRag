@@ -1,31 +1,45 @@
 import json
-import sqlite3
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
 
 from emergency_rag.chunking.rule import RuleChunker
-from emergency_rag.data.models import Rule, SearchUnit
-from emergency_rag.data.repository import RuleRepository
+from emergency_rag.chunking.base import Chunker
+from emergency_rag.data.models import Rule, SearchUnit, dataset_index_directory
+from emergency_rag.data.pipeline import DatasetPipeline
 from emergency_rag.retrieval.models import Candidate
-from scripts.prepare_rules import prepare_rules, read_rules
+from emergency_rag.data.pipeline import read_rules
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_real_rules_are_preserved(database):
+@pytest.fixture
+def stub_index_build(monkeypatch):
+    # 本文件检查读取与分块契约；真实双路构建由 test_indexes 覆盖。
+    def build(units, index_root, *, tokenizer, embedding, overwrite):
+        directory = dataset_index_directory(
+            index_root, units[0].metadata["dataset"], units[0].metadata["chunker"]["strategy"], tokenizer.name,
+        )
+        directory.mkdir(parents=True)
+        (directory / "units.json").write_text(json.dumps([unit.model_dump() for unit in units]), encoding="utf-8")
+        return directory
+
+    monkeypatch.setattr("emergency_rag.data.pipeline.build_dataset_indexes", build)
+
+
+def test_real_rules_are_preserved():
     source = ROOT / "datasets/初赛规则集rules1.json"
     raw = json.loads(source.read_text(encoding="utf-8"))
-    stats = prepare_rules(source, database)
-    assert stats["rules"] == stats["search_units"] == 800
-    repository = RuleRepository(database)
-    rules = {rule.rule_id: rule for rule in repository.load_rules()}
-    units = {unit.rule_id: unit for unit in repository.load_search_units()}
-    for row in raw:
-        assert rules[row["rule_id"]].text == row["rule_text"]
-        assert units[row["rule_id"]].text == row["rule_text"]
-        assert units[row["rule_id"]].unit_id == f"rule:{row['rule_id']}"
+    rules = read_rules(source)
+    units = RuleChunker().chunk(rules)
+    assert len(rules) == len(units) == 800
+    # 分块直接保留原规则 ID 和文本，不通过额外数据库中转。
+    for row, rule, unit in zip(raw, rules, units, strict=True):
+        assert rule.rule_id == unit.rule_id == row["rule_id"]
+        assert rule.text == unit.text == row["rule_text"]
+        assert unit.unit_id == f"rule:{row['rule_id']}"
 
 
 @pytest.mark.parametrize("rows", [
@@ -63,29 +77,35 @@ def test_candidate_final_contract(fields):
         Candidate(unit_id="a", rule_id="1", text="甲", **fields)
 
 
-def test_overwrite_and_transaction_rollback(database, tmp_path, monkeypatch):
+@pytest.mark.parametrize("dataset_name", ["preliminary", "semifinal"])
+def test_dataset_pipeline_records_provenance(dataset_name, tmp_path, stub_index_build):
+    source = ROOT / "datasets/初赛规则集rules1.json"
+    dataset = DatasetPipeline(embedding=Mock(), index_root=tmp_path).prepare(source, dataset_name=dataset_name)
+    units = list(dataset.units.values())
+    assert len(units) == 800
+    assert all(unit.metadata == {"dataset": dataset_name, "chunker": {"strategy": "rule"}} for unit in units)
+    units[0].metadata["chunker"]["strategy"] = "changed"
+    assert units[1].metadata["chunker"]["strategy"] == "rule"
+
+
+def test_dataset_pipeline_preserves_chunker_metadata_and_output(tmp_path, stub_index_build):
+    output = SearchUnit(unit_id="1:1", rule_id="1", text="分块文本", metadata={"offset": 8})
+    observed = []
+
+    class CustomChunker(Chunker):
+        name = "custom"
+
+        def chunk(self, records):
+            observed.extend(records)
+            return [output]
+
     source = tmp_path / "rules.json"
-    source.write_text('[{"rule_id":"1","rule_text":"原文"}]', encoding="utf-8")
-    prepare_rules(source, database)
-    with pytest.raises(FileExistsError):
-        prepare_rules(source, database)
-    source.write_text('[{"rule_id":"2","rule_text":"新文"}]', encoding="utf-8")
-
-    # 在删除旧记录后的写入阶段制造真实外键错误，证明整批回滚。
-    with monkeypatch.context() as patch:
-        patch.setattr(RuleChunker, "chunk", lambda self, records: [
-            SearchUnit(unit_id="bad", rule_id="missing", text="错误"),
-        ])
-        with pytest.raises(sqlite3.IntegrityError):
-            prepare_rules(source, database, overwrite=True)
-    assert RuleRepository(database).load_rules() == [Rule(rule_id="1", text="原文")]
-    assert RuleRepository(database).load_search_units()[0].unit_id == "rule:1"
-    prepare_rules(source, database, overwrite=True)
-    assert RuleRepository(database).load_rules() == [Rule(rule_id="2", text="新文")]
-
-
-def test_missing_database_read_does_not_create_file(tmp_path):
-    database = tmp_path / "missing.db"
-    with pytest.raises(sqlite3.OperationalError):
-        RuleRepository(database).load_search_units()
-    assert not database.exists()
+    source.write_text('[{"rule_id":"1","rule_text":"完整原文"}]', encoding="utf-8")
+    dataset = DatasetPipeline(embedding=Mock(), index_root=tmp_path, chunker=CustomChunker()).prepare(
+        source, dataset_name="preliminary",
+    )
+    units = list(dataset.units.values())
+    assert observed == [Rule(rule_id="1", text="完整原文")]
+    assert units[0].text == "分块文本"
+    assert units[0].metadata == {"offset": 8, "dataset": "preliminary", "chunker": {"strategy": "custom"}}
+    assert output.metadata == {"offset": 8}

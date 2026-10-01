@@ -1,13 +1,12 @@
-from abc import ABC, abstractmethod
+from abc import ABC
 
 from emergency_rag.retrieval.models import Candidate
 
 
 class Reranker(ABC):
-    """完整评分和排序接口。"""
+    """重排接口，默认原样返回候选，便于独立验证检索链路。"""
 
-    name: str
+    name = "passthrough"
 
-    @abstractmethod
     def rerank(self, query: str, candidates: list[Candidate]) -> list[Candidate]:
-        raise NotImplementedError
+        return candidates

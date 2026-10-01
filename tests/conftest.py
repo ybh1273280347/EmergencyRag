@@ -2,12 +2,12 @@
 
 import os
 import socket
+from unittest.mock import Mock
 
 import pytest
 
-from emergency_rag.clients.embedding import EmbeddingClientConfig
-from emergency_rag.retrieval.rerank.zero_entropy import ZeroEntropyRerankerConfig
 from emergency_rag.retrieval.models import Candidate
+from emergency_rag.data.models import IndexedDataset
 
 
 @pytest.fixture(autouse=True)
@@ -24,18 +24,8 @@ def isolate_environment_and_network(monkeypatch):
 
 
 @pytest.fixture
-def database(tmp_path):
-    return tmp_path / "emergency.db"
-
-
-@pytest.fixture
-def embedding_config():
-    return EmbeddingClientConfig(model="test-embedding")
-
-
-@pytest.fixture
-def rerank_config():
-    return ZeroEntropyRerankerConfig(model="test-reranker")
+def dataset():
+    return Mock(spec=IndexedDataset)
 
 
 @pytest.fixture

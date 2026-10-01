@@ -1,8 +1,18 @@
-"""规则事实及索引单元；text 始终保存原始规则文本。"""
+"""规则、检索单元和已索引数据集。"""
 
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import bm25s
+import faiss
+import numpy as np
+from bm25s.tokenization import Tokenizer
 from pydantic import BaseModel, Field, field_validator
+
+from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 
 
 class Rule(BaseModel):
@@ -22,3 +32,56 @@ class SearchUnit(BaseModel):
     rule_id: str
     text: str
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+def dataset_index_directory(index_root: Path, dataset_name: str, strategy: str, tokenizer_name: str) -> Path:
+    """准备与构建共用的目录命名规则，在读取原始文件前即可确定位置。"""
+    for name in (dataset_name, strategy, tokenizer_name):
+        if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", name) is None:
+            raise ValueError("dataset、chunker strategy 和 tokenizer name 必须为小写英文名称，可包含数字和连字符")
+    return (Path(index_root) / f"{dataset_name}-{strategy}-{tokenizer_name}").resolve()
+
+
+@dataclass(slots=True)
+class IndexedDataset:
+    directory: Path
+    # 从准备流水线携带同一分词器，检索组件不再接受独立分词配置。
+    tokenizer: TextTokenizer
+    units: dict[str, SearchUnit] = field(init=False)
+    _bm25: tuple[bm25s.BM25, Tokenizer, list[str]] | None = field(default=None, init=False, repr=False)
+    _dense: tuple[faiss.IndexFlatIP, list[str]] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.directory = Path(self.directory).resolve()
+        records = json.loads((self.directory / "units.json").read_text(encoding="utf-8"))
+        self.units = {record["unit_id"]: SearchUnit(**record) for record in records}
+        # Dataset 拥有索引资源，加载时一次性读取已有产物；查询只复用内存对象。
+        if (self.directory / "bm25").is_dir():
+            self.load_bm25()
+        if (self.directory / "dense").is_dir():
+            self.load_dense()
+
+    def load_bm25(self) -> tuple[bm25s.BM25, Tokenizer, list[str]]:
+        """加载离线索引与词表，查询分词使用 Dataset 携带的分词器。"""
+        if self._bm25 is not None:
+            return self._bm25
+        directory = self.directory / "bm25"
+        index = bm25s.BM25.load(str(directory), load_corpus=False)
+        vocabulary = Tokenizer(splitter=self.tokenizer.tokenize, stopwords=[], stemmer=None)
+        vocabulary.load_vocab(str(directory))
+        unit_ids = json.loads((directory / "unit_ids.json").read_text(encoding="utf-8"))
+        self._bm25 = index, vocabulary, unit_ids
+        return self._bm25
+
+    def load_dense(self) -> tuple[faiss.IndexFlatIP, list[str]]:
+        """加载 Dense 产物，不读取构建说明或调用文档 Embedding。"""
+        if self._dense is not None:
+            return self._dense
+        directory = self.directory / "dense"
+        # 序列化字节避开 FAISS 原生文件 API 的 Windows Unicode 路径限制。
+        index = faiss.deserialize_index(
+            np.frombuffer((directory / "faiss.index").read_bytes(), dtype="uint8"),
+        )
+        unit_ids = json.loads((directory / "faiss_mapping.json").read_text(encoding="utf-8"))
+        self._dense = index, unit_ids
+        return self._dense
