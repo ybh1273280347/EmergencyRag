@@ -39,7 +39,7 @@ def run_choice_experiment(
 
 if __name__ == "__main__":
     # 作答需 TypeSafe 密钥。
-    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/baseline.yaml")
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/preliminary/baseline.yaml")
     client = get_choice_qa_client()
     result, answer = run_choice_experiment(
         pipeline=pipeline,

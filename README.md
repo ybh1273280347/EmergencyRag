@@ -2,18 +2,30 @@
 
 本项目把规则数据准备和检索封装为可组合的流水线。实验通常只需配置 YAML、在 settings.py 填写模型参数、在 .env 填写密钥，再调用 `load_pipeline()`，就能得到可直接检索的对象。
 
-项目自动完成规则读取、检索单元生成、BM25 / Dense 索引构建或复用、检索组件装配，以及完整规则证据输出。合作者需要在实验代码中完成题目读取、作答提示词、答案解析、准确率计算和结果保存。
+项目自动完成规则读取、检索单元生成、BM25 / Dense 索引构建或复用、检索组件装配，以及完整规则证据输出。[experiments/README.md](experiments/README.md) 提供选择题评估 CLI，支持按题完整 JSONL 分片保存、独立检查点与中断恢复、按 question id 重跑，以及答案准确率、规则 Recall、完整规则覆盖率和 nDCG 四项指标。
+
+## 批量实验使用说明
+
+完整的命令、参数默认值、结果影响、恢复与重跑方式见 **[实验 CLI 参数与结果影响说明](experiments/README.md#实验-cli命令参数与结果影响)**。
+
+**重点：实验最终检索 Top-K 为 `max(max(metric_top_k), answer_top_k)`。** 默认最终检索最多 20 条规则，作答使用前 3 条；修改 `--metric-top-k` 也可能改变最终检索与保存的规则数量。例如 `--metric-top-k 1 3 5 --answer-top-k 3` 最终检索最多 5 条，作答仍使用前 3 条。详细预算关系和对照实验目录隔离要求见实验 README。
 
 ## 项目目录与核心入口
 
 ```text
 .
-├── config/                 YAML 实验配置
+├── config/
+│   └── preliminary/         初赛集 Pipeline YAML：baseline.yaml、example.yaml
 ├── data/
 │   ├── raw/                 原始规则语料与验证题目
+│   ├── processed/           保存已拆分选项、修复后的验证集
 │   ├── indexes/             自动生成并复用的 BM25 / Dense 索引
 │   └── cache/               查询处理结果与查询向量缓存
 ├── examples/                单题检索、Chat 作答、TypeSafe 单选示例
+├── experiments/             批量选择题评估 CLI、完整日志与恢复检查点、指标报告
+├── scripts/                 一次性离线数据整理、修复与旧实验迁移脚本
+├── results/
+│   └── preliminary/         按数据集隔离的结果，如 baseline-typesafe-answer-k3/
 ├── models/                  本地模型权重（如 BCE Reranker）
 ├── src/emergency_rag/
 │   ├── load_pipeline.py      YAML 加载入口，构造组件、准备数据并返回检索流水线
@@ -31,7 +43,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| [config/baseline.yaml](config/baseline.yaml) | 默认实验配置：BM25 + Dense 召回、RRF 融合、本地 BCE 重排。 |
+| [config/preliminary/baseline.yaml](config/preliminary/baseline.yaml) | 默认实验配置：BM25 + Dense 召回、RRF 融合、本地 BCE 重排。 |
 | [src/emergency_rag/load_pipeline.py](src/emergency_rag/load_pipeline.py) | `load_pipeline(path)` 的实现入口，读取 YAML、装配注册组件、准备或复用索引。 |
 | [src/emergency_rag/retrieval/pipeline.py](src/emergency_rag/retrieval/pipeline.py) | 编排查询处理、召回、融合、扩展、重排、规则聚合、Gate 和最终 Top-K。 |
 | [src/emergency_rag/data/pipeline.py](src/emergency_rag/data/pipeline.py) | 读取规则、生成 SearchUnit、合并 metadata，并构建或加载数据集索引。 |
@@ -40,6 +52,10 @@
 | [examples/retrieve_experiment.py](examples/retrieve_experiment.py) | 只检索的单题演示，不调用作答模型。 |
 | [examples/chat_experiment.py](examples/chat_experiment.py) | 检索后调用 Chat 作答的单题示例。 |
 | [examples/choice_qa_experiment.py](examples/choice_qa_experiment.py) | 检索后调用 TypeSafe / Jev 选择单项答案的示例。 |
+| [experiments/__main__.py](experiments/__main__.py) | 批量评估入口：run、resume、rerun、summarize。 |
+| [experiments/metrics.py](experiments/metrics.py) | 计算四项核心指标和规则命中分布，生成 JSON / Markdown 总体摘要。 |
+| [experiments/negative.py](experiments/negative.py) | 按题汇总答错与调用失败，生成 JSON / Markdown 负样本分析。 |
+| [scripts/normalize_dev.py](scripts/normalize_dev.py) | 一次性拆分题干与选项、修复原始验证集，保存整理后的数据。 |
 | [tests/](tests/) | 覆盖数据、索引、组件装配、检索流程、客户端与缓存行为。 |
 
 `retrieval/` 内按职责拆分阶段：`retrievers/` 负责 BM25 与 Dense 召回，`fusion/` 提供 RRF 和 Union，`rerank/` 提供 BCE 与 Qwen，`query/` 负责查询处理及缓存；`models.py` 定义查询上下文、Unit 候选、完整规则证据和检索结果。扩展规则单元构建策略见 `data/units/`，扩展检索组件则实现相应阶段的 ABC 并登记到 `registry.py`。
@@ -74,12 +90,12 @@ Embedding 默认 `qwen3-embedding-4b`，Qwen Reranker 默认 `qwen3-reranker-4b`
 
 配置在 `settings` 实例创建时读取；SDK 客户端仍首次使用时才创建并缓存。修改配置后重启实验进程。未使用的模型不要求密钥，实际获取该模型时才检查模型名与密钥是否齐全。
 
-使用 [config/baseline.yaml](config/baseline.yaml) 加载检索流水线：
+使用 [config/preliminary/baseline.yaml](config/preliminary/baseline.yaml) 加载检索流水线：
 
 ```python
 from emergency_rag.load_pipeline import load_pipeline
 
-pipeline = load_pipeline("config/baseline.yaml")
+pipeline = load_pipeline("config/preliminary/baseline.yaml")
 result = pipeline.retrieve("危险化学品事故应急结束需要满足哪些条件？", top_k=10)
 
 for rule in result.evidence:
@@ -97,9 +113,9 @@ for rule in result.evidence:
 
 ```yaml
 dataset:
-  source: ../data/raw/初赛规则集rules1.json
+  source: ../../data/raw/初赛规则集rules1.json
   dataset_name: preliminary
-  index_root: ../data/indexes
+  index_root: ../../data/indexes
   overwrite: false
   unit_builder: rule
   tokenizer: jieba
@@ -178,7 +194,7 @@ data/cache/
 需要显式更新某个问题时，直接刷新对应缓存：
 
 ```python
-pipeline = load_pipeline("config/baseline.yaml")
+pipeline = load_pipeline("config/preliminary/baseline.yaml")
 pipeline.query_processor.process("原始问题", refresh=True)
 
 from emergency_rag.clients.embedding import get_embedding_client
@@ -341,13 +357,13 @@ pipeline = RetrievalPipeline(
 
 仓库提供三个单题入口，均从项目根目录运行。它们使用仓库规则集和对应的默认 YAML 配置；第一次运行会建立 BM25 与 Dense 两路索引，因此需要 Embedding 服务。三个示例入口当前都启用本地 BCE 重排，还需要 `models/bce-reranker-base_v1` 权重；BCE 不会自动下载模型。输出为单题演示，不会读取验证集或计算完整数据集准确率。
 
-只运行检索可使用 [examples/retrieve_experiment.py](examples/retrieve_experiment.py)：它加载 [config/example.yaml](config/example.yaml)，用 BM25 召回、RRF 融合和 BCE 重排，并连续运行同一问题两次展示冷启动与预热查询。需要 Embedding 配置和本地 BCE 权重，不需要 Chat 或 TypeSafe 密钥：
+只运行检索可使用 [examples/retrieve_experiment.py](examples/retrieve_experiment.py)：它加载 [config/preliminary/example.yaml](config/preliminary/example.yaml)，用 BM25 召回、RRF 融合和 BCE 重排，并连续运行同一问题两次展示冷启动与预热查询。需要 Embedding 配置和本地 BCE 权重，不需要 Chat 或 TypeSafe 密钥：
 
 ```powershell
 uv run python examples/retrieve_experiment.py
 ```
 
-检索并调用 Chat 作答可运行 [examples/chat_experiment.py](examples/chat_experiment.py)。它加载 [config/baseline.yaml](config/baseline.yaml)，需要本地 BCE 权重、Embedding 配置，以及 `RAG_CHAT_API_KEY` 和 `RAG_CHAT_MODEL`：
+检索并调用 Chat 作答可运行 [examples/chat_experiment.py](examples/chat_experiment.py)。它加载 [config/preliminary/baseline.yaml](config/preliminary/baseline.yaml)，需要本地 BCE 权重、Embedding 配置，以及 `RAG_CHAT_API_KEY` 和 `RAG_CHAT_MODEL`：
 
 ```powershell
 uv run python examples/chat_experiment.py
@@ -358,7 +374,7 @@ from emergency_rag.clients.chat import get_chat_client
 from emergency_rag.load_pipeline import load_pipeline
 from examples.chat_experiment import run_experiment
 
-pipeline = load_pipeline("config/baseline.yaml")
+pipeline = load_pipeline("config/preliminary/baseline.yaml")
 chat = get_chat_client()
 
 result, answer = run_experiment(
@@ -401,7 +417,7 @@ TYPESAFE_BASE_URL=your-bse-url
 from emergency_rag.clients.choice_qa_client import get_choice_qa_client
 from emergency_rag.load_pipeline import load_pipeline
 
-pipeline = load_pipeline("config/baseline.yaml")
+pipeline = load_pipeline("config/preliminary/baseline.yaml")
 choice_client = get_choice_qa_client()
 result = pipeline.retrieve("事故现场应急处置工作结束需要谁确认和批准？", top_k=10)
 

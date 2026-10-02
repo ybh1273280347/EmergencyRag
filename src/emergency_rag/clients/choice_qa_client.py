@@ -7,6 +7,14 @@ from emergency_rag.settings import settings
 from typesafe_sdk import Choice, ChoiceAnswer, JSONContent, RetryPolicy, TypeSafeClient
 
 
+class ChoiceQAResponseError(ValueError):
+    """非法作答响应携带原始内容，批量实验仍可保存付费请求的返回结果。"""
+
+    def __init__(self, message: str, body: dict) -> None:
+        super().__init__(message)
+        self.body = body
+
+
 class ChoiceQAClient:
     """发送一次单选请求，返回 SDK 答案；不拼业务提示词或计算准确率。"""
 
@@ -31,20 +39,17 @@ class ChoiceQAClient:
 
         answer = response.answers.get("answer")
         if not isinstance(answer, ChoiceAnswer):
-            raise ValueError("TypeSafe 响应缺少 Choice 答案 answer")
+            raise ChoiceQAResponseError("TypeSafe 响应缺少 Choice 答案 answer", response.model_dump(mode="json"))
 
         if answer.choice not in choices or set(answer.probabilities) != set(choices):
-            raise ValueError("TypeSafe 响应选项与请求不一致")
+            raise ChoiceQAResponseError("TypeSafe 响应选项与请求不一致", response.model_dump(mode="json"))
 
         values_to_check = [answer.confidence, *answer.probabilities.values()]
         if any(not math.isfinite(v) or not 0 <= v <= 1 for v in values_to_check):
-                raise ValueError("TypeSafe 置信度与概率必须为 [0, 1] 内的有限数值")
+            raise ChoiceQAResponseError("TypeSafe 置信度与概率必须为 [0, 1] 内的有限数值", response.model_dump(mode="json"))
 
         return answer
 
-    @staticmethod
-    def _validate_answer(answer: object, choices: dict[str, str]) -> None:
-        """校验答案实例身份、选项一致性及概率分布有效性。"""
 
 
 

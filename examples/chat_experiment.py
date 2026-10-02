@@ -35,7 +35,7 @@ def run_experiment(
 
 if __name__ == "__main__":
     # 连接配置来自 settings 和 .env；示例只声明实验问题与作答指令。
-    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/baseline.yaml")
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/preliminary/baseline.yaml")
     chat = get_chat_client()
     result, answer = run_experiment(
         pipeline=pipeline,

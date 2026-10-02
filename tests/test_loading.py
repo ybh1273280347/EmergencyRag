@@ -241,7 +241,7 @@ def test_shipped_baseline_loads_bce_without_qwen_credentials(experiment_yaml, mo
     from unittest.mock import Mock
 
     path, config, embedding_model, calls = experiment_yaml
-    baseline = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/baseline.yaml").read_text(encoding="utf-8"))
+    baseline = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/preliminary/baseline.yaml").read_text(encoding="utf-8"))
     baseline["dataset"] = config["dataset"]
     model = Mock()
     model.rerank.return_value = {"rerank_ids": [1, 0], "rerank_scores": [0.9, 0.1]}

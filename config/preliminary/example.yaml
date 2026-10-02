@@ -1,8 +1,8 @@
-# 直接验证检索与作答：默认重排器原样返回，不请求重排模型。
+# 单题检索示例：BM25、RRF 与本地 BCE；不请求云端重排模型。
 dataset:
-  source: ../data/raw/初赛规则集rules1.json
+  source: ../../data/raw/初赛规则集rules1.json
   dataset_name: preliminary
-  index_root: ../data/indexes
+  index_root: ../../data/indexes
   overwrite: false
   unit_builder: rule
   tokenizer: jieba

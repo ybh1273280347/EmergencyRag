@@ -23,6 +23,7 @@ def isolate_environment_and_network(monkeypatch, tmp_path):
             monkeypatch.delenv(name)
 
     isolated = settings_module.Settings()
+    monkeypatch.setattr(settings_module, "settings", isolated)
     isolated.query_cache_root = tmp_path / "cache"
     for module in (chat, choice_qa_client, embedding, qwen):
         monkeypatch.setattr(module, "settings", isolated)

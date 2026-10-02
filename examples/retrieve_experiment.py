@@ -8,7 +8,7 @@ from emergency_rag.load_pipeline import load_pipeline
 
 if __name__ == "__main__":
     # 连接配置来自 settings 和 .env；示例只声明实验问题与作答指令。
-    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/example.yaml")
+    pipeline = load_pipeline(Path(__file__).resolve().parents[1] / "config/preliminary/example.yaml")
 
     # 冷启动
     result = pipeline.retrieve(

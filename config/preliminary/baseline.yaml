@@ -1,8 +1,8 @@
 # 模型连接、模型名、超时和重试由对应模块读取环境配置，YAML 只声明实验参数。
 dataset:
-  source: ../data/raw/初赛规则集rules1.json
+  source: ../../data/raw/初赛规则集rules1.json
   dataset_name: preliminary
-  index_root: ../data/indexes
+  index_root: ../../data/indexes
   overwrite: false
   unit_builder: rule
   tokenizer: jieba
