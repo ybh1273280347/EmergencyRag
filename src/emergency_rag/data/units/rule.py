@@ -1,6 +1,4 @@
-from emergency_rag.data.models import Rule, SearchUnit
-
-from .base import UnitBuilder
+from .base import UnitBuilder, Rule, SearchUnit
 
 
 class RuleUnitBuilder(UnitBuilder):

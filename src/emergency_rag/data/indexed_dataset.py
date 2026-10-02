@@ -4,41 +4,14 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-import warnings
-
-# 忽略包含该特定文本的警告
-warnings.filterwarnings("ignore", message=".*resource module not available on Windows.*")
 
 import bm25s
 import faiss
 import numpy as np
 from bm25s.tokenization import Tokenizer
-from pydantic import BaseModel, Field, field_validator
 
+from emergency_rag.data.units.base import Rule, SearchUnit
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
-
-
-class Rule(BaseModel):
-    rule_id: str
-    text: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("rule_id", "text")
-    @classmethod
-    def require_nonblank(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("规则 ID 和文本不能为空")
-        return value
-
-
-class SearchUnit(BaseModel):
-    unit_id: str
-    rule_id: str
-    text: str          # 单元原文，用于重排和命中记录
-    index_text: str    # 离线索引文本，可包含主题、领域等增强内容
-    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def dataset_index_directory(

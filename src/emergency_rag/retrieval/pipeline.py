@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from time import perf_counter
 
-from emergency_rag.data.models import IndexedDataset
+from emergency_rag.data.indexed_dataset import IndexedDataset
 
 from .expansion.base import CandidateExpander
 from .fusion.base import Fusion

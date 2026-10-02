@@ -219,9 +219,9 @@ Dataset 目录固定为：
 继承对应阶段的 ABC，提供稳定的英文 `name`，实现下表接口。简单参数直接写构造函数；只有确实复杂的初始化才需要组件自己的 Config 类。
 
 
-| 扩展点与接口模块                                   | 方法                                                                 | 需要保持的语义                                                |
-| -------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------- |
-| `units/base.py`：`UnitBuilder`                     | `build(rules: list[Rule]) -> list[SearchUnit]`                       | 每个 Unit 关联已有 Rule；可切分子规则或增强索引文本           |
+| 扩展点与接口模块                                          | 方法                                                                 | 需要保持的语义                                                |
+|---------------------------------------------------| -------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `data/units/base.py`：`UnitBuilder`                | `build(rules: list[Rule]) -> list[SearchUnit]`                       | 每个 Unit 关联已有 Rule；可切分子规则或增强索引文本           |
 | `retrieval/tokenizer/base.py`：`TextTokenizer`     | `tokenize(text: str) -> list[str]`                                   | 索引与查询共用同一策略                                        |
 | `retrieval/query/base.py`：`QueryProcessor`        | `process(query: str) -> QueryContext`                                | 保留`original_query`；可设置 `rewritten_query`、`sub_queries` |
 | `retrieval/retrievers/base.py`：`Retriever`        | `retrieve(query: str, dataset: IndexedDataset) -> list[Candidate]`   | 返回有序 Unit 候选，预算在初始化时确定                        |
@@ -235,9 +235,10 @@ Dataset 目录固定为：
 例如，将规则主题加入索引文本，同时保留原文：
 
 ```python
-from emergency_rag.data.models import Rule, SearchUnit
+
+from emergency_rag.data.units.base import Rule, SearchUnit
 from emergency_rag.registry import COMPONENT_REGISTRY
-from emergency_rag.units.base import UnitBuilder
+from emergency_rag.data.units import UnitBuilder
 from emergency_rag.load_pipeline import load_pipeline
 
 

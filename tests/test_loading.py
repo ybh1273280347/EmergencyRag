@@ -10,7 +10,7 @@ from openai import OpenAI
 
 from emergency_rag.clients import chat, embedding
 from emergency_rag import settings as settings_module
-from emergency_rag.data.models import SearchUnit
+from emergency_rag.data.units.base import SearchUnit
 from emergency_rag.data.pipeline import DatasetPipeline
 from emergency_rag.load_pipeline import PipelineConfigError, load_pipeline
 from emergency_rag.registry import COMPONENT_REGISTRY
@@ -20,7 +20,7 @@ from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.query.base import QueryProcessor
 from emergency_rag.retrieval.rerank import bce, qwen
 from emergency_rag.retrieval.rerank.base import Reranker
-from emergency_rag.units.base import UnitBuilder
+from emergency_rag.data.units import UnitBuilder
 
 
 class EnhancedUnitBuilder(UnitBuilder):

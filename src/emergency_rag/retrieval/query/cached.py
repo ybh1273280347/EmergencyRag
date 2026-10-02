@@ -22,11 +22,6 @@ class CachedQueryProcessor(QueryProcessor):
             context = QueryContext.model_validate(self.cache.data[query])
         else:
             context = self.processor.process(query)
-
-        if context.original_query != query or any(not text.strip() for text in context.queries):
-            raise ValueError("QueryProcessor 必须保留原查询并返回非空检索文本")
-        if not hit:
             self.cache.save({**self.cache.data, query: context.model_dump(mode="json")})
 
-        # 缓存存储模型快照，不共享可变 sub_queries 列表。
-        return context.model_copy(deep=True)
+        return context

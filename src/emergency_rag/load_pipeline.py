@@ -17,7 +17,7 @@ from emergency_rag.retrieval.query.cached import CachedQueryProcessor
 from emergency_rag.retrieval.rerank.base import Reranker
 from emergency_rag.retrieval.retrievers.base import Retriever
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
-from emergency_rag.units.base import UnitBuilder
+from emergency_rag.data.units import UnitBuilder
 
 
 class PipelineConfigError(ValueError):

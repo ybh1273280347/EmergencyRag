@@ -2,7 +2,7 @@ import faiss
 import numpy as np
 
 from emergency_rag.clients.embedding import EmbeddingClient
-from emergency_rag.data.models import IndexedDataset
+from emergency_rag.data.indexed_dataset import IndexedDataset
 from emergency_rag.retrieval.models import Candidate
 
 from .base import Retriever

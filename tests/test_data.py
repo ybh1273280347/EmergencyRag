@@ -5,9 +5,10 @@ from unittest.mock import NonCallableMock
 import pytest
 from pydantic import ValidationError
 
-from emergency_rag.units.rule import RuleUnitBuilder
-from emergency_rag.units.base import UnitBuilder
-from emergency_rag.data.models import Rule, SearchUnit, dataset_index_directory
+from emergency_rag.data.units import RuleUnitBuilder
+from emergency_rag.data.units import UnitBuilder
+from emergency_rag.data.indexed_dataset import dataset_index_directory
+from emergency_rag.data.units.base import Rule, SearchUnit
 from emergency_rag.data.pipeline import DatasetPipeline
 from emergency_rag.retrieval.models import Candidate, RuleEvidence
 from emergency_rag.data.pipeline import read_rules

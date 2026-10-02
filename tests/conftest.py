@@ -7,7 +7,8 @@ from unittest.mock import Mock
 import pytest
 
 from emergency_rag.retrieval.models import Candidate
-from emergency_rag.data.models import IndexedDataset, Rule
+from emergency_rag.data.indexed_dataset import IndexedDataset
+from emergency_rag.data.units.base import Rule
 from emergency_rag.clients import chat, choice_qa_client, embedding
 from emergency_rag.retrieval.rerank import qwen
 from emergency_rag import settings as settings_module

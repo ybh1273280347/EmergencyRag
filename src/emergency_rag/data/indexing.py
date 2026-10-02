@@ -15,7 +15,8 @@ from bm25s.tokenization import Tokenizer
 from emergency_rag.clients.embedding import EmbeddingClient
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 
-from .models import Rule, SearchUnit, dataset_index_directory
+from .indexed_dataset import dataset_index_directory
+from .units.base import Rule, SearchUnit
 
 
 def _normalize_vectors(vectors: np.ndarray, dimension: int | None = None) -> np.ndarray:
