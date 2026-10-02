@@ -1,12 +1,13 @@
 """数据集准备流水线，缓存目录命中时跳过全部离线计算。"""
 
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from emergency_rag.unit_building.base import UnitBuilder
-from emergency_rag.unit_building.rule import RuleUnitBuilder
+from emergency_rag.units.base import UnitBuilder
+from emergency_rag.units.rule import RuleUnitBuilder
 from emergency_rag.clients.embedding import EmbeddingClient
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
@@ -48,7 +49,8 @@ def read_rules(source: Path) -> list[Rule]:
 class DatasetPipeline:
     """读取规则、构建检索单元和双路索引，返回可直接检索的数据集。"""
 
-    embedding: EmbeddingClient
+    embedding: EmbeddingClient | Callable[[], EmbeddingClient]
+    embedding_model: str | None = None  # 使用延迟工厂时声明模型名，缓存查找无需创建客户端。
     index_root: Path = field(default_factory=lambda: Path("data/indexes"))
     unit_builder: UnitBuilder = field(default_factory=RuleUnitBuilder)
     tokenizer: TextTokenizer = field(default_factory=JiebaTokenizer)
@@ -60,11 +62,15 @@ class DatasetPipeline:
         dataset_name: str,
         overwrite: bool = False,
     ) -> IndexedDataset:
+        model = self.embedding_model if callable(self.embedding) else self.embedding.model
+        if not model:
+            raise ValueError("使用 Embedding 工厂时必须声明 embedding_model")
         directory = dataset_index_directory(
             self.index_root,
             dataset_name,
             self.unit_builder.name,
             self.tokenizer.name,
+            model,
         )
 
         # 已有产物是本次实验的输入，命中时不读源文件、不构建单元、不请求文档向量。
@@ -90,12 +96,17 @@ class DatasetPipeline:
             })
             units.append(unit.model_copy(update={"metadata": metadata}))
 
+        # 客户端工厂仅在缓存未命中或显式重建时调用；读取索引不需要模型凭据。
+        embedding = self.embedding() if callable(self.embedding) else self.embedding
+        # 工厂声明与实际构建模型必须一致，避免产物写到另一个缓存目录。
+        if embedding.model != model:
+            raise ValueError("Embedding 工厂的实际模型与 embedding_model 声明不一致")
         directory = build_dataset_indexes(
             units,
             self.index_root,
             rules=rules,
             tokenizer=self.tokenizer,
-            embedding=self.embedding,
+            embedding=embedding,
             overwrite=overwrite,
         )
 

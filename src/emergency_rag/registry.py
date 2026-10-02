@@ -9,12 +9,12 @@ from emergency_rag.retrieval.fusion.rrf import RRFFusion
 from emergency_rag.retrieval.fusion.union import UnionFusion
 from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.query.base import QueryProcessor
-from emergency_rag.retrieval.rerank import zero_entropy
+from emergency_rag.retrieval.rerank import bce, qwen
 from emergency_rag.retrieval.rerank.base import Reranker
 from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
 from emergency_rag.retrieval.retrievers.dense import DenseRetriever
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
-from emergency_rag.unit_building.rule import RuleUnitBuilder
+from emergency_rag.units.rule import RuleUnitBuilder
 
 
 def _dense_retriever(**params: Any) -> DenseRetriever:
@@ -24,8 +24,12 @@ def _dense_retriever(**params: Any) -> DenseRetriever:
     )
 
 
-def _zeroentropy_reranker(**params: Any) -> zero_entropy.ZeroEntropyReranker:
-    return zero_entropy.get_rerank_model(**params)
+def _qwen_reranker(**params: Any) -> qwen.QwenReranker:
+    return qwen.get_rerank_model(**params)
+
+
+def _bce_reranker(**params: Any) -> bce.BCEReranker:
+    return bce.get_rerank_model(**params)
 
 
 COMPONENT_REGISTRY: dict[str, dict[str, Callable[..., Any]]] = {
@@ -51,7 +55,8 @@ COMPONENT_REGISTRY: dict[str, dict[str, Callable[..., Any]]] = {
     },
     "reranker": {
         Reranker.name: Reranker,
-        zero_entropy.ZeroEntropyReranker.name: _zeroentropy_reranker,
+        qwen.QwenReranker.name: _qwen_reranker,
+        bce.BCEReranker.name: _bce_reranker,
     },
     "gate": {
         EvidenceGate.name: EvidenceGate,

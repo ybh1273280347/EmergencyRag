@@ -1,0 +1,15 @@
+{
+  "index_version": 1,
+  "build_time": "2026-10-01T19:29:44.676726+00:00",
+  "document_count": 800,
+  "rule_count": 800,
+  "dataset": "preliminary",
+  "unit_builder": {
+    "strategy": "rule"
+  },
+  "tokenizer": {
+    "strategy": "jieba"
+  },
+  "embedding_model": "qwen3-embedding-4b",
+  "embedding_dimension": 2560
+}

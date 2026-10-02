@@ -24,7 +24,7 @@ class DenseRetriever(Retriever):
 
         # 文档向量离线时已归一化；在线只需处理查询向量
         vector = np.ascontiguousarray(
-            self.embedding.embed(query)[None, :],
+            self.embedding.embed_query(query)[None, :],
             dtype=np.float32,
         )
         faiss.normalize_L2(vector)

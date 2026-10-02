@@ -1,12 +1,12 @@
 import json
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import NonCallableMock
 
 import pytest
 from pydantic import ValidationError
 
-from emergency_rag.unit_building.rule import RuleUnitBuilder
-from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.units.rule import RuleUnitBuilder
+from emergency_rag.units.base import UnitBuilder
 from emergency_rag.data.models import Rule, SearchUnit, dataset_index_directory
 from emergency_rag.data.pipeline import DatasetPipeline
 from emergency_rag.retrieval.models import Candidate, RuleEvidence
@@ -15,12 +15,21 @@ from emergency_rag.data.pipeline import read_rules
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("model, suffix", [
+    ("qwen3-embedding-4b", "qwen3-embedding-4b"),
+    ("Qwen/Qwen3-Embedding-4B", "Qwen-Qwen3-Embedding-4B"),
+])
+def test_index_directory_includes_embedding_model(tmp_path, model, suffix):
+    directory = dataset_index_directory(tmp_path, "preliminary", "rule", "jieba", model)
+    assert directory == tmp_path / f"preliminary-rule-jieba-{suffix}"
+
+
 @pytest.fixture
 def stub_index_build(monkeypatch):
     # 本文件检查读取与单元契约；真实双路构建由 test_indexes 覆盖。
     def build(units, index_root, *, rules, tokenizer, embedding, overwrite):
         directory = dataset_index_directory(
-            index_root, units[0].metadata["dataset"], units[0].metadata["unit_builder"]["strategy"], tokenizer.name,
+            index_root, units[0].metadata["dataset"], units[0].metadata["unit_builder"]["strategy"], tokenizer.name, embedding.model,
         )
         directory.mkdir(parents=True)
         (directory / "rules.json").write_text(json.dumps([rule.model_dump() for rule in rules]), encoding="utf-8")
@@ -31,7 +40,7 @@ def stub_index_build(monkeypatch):
 
 
 def test_real_rules_are_preserved():
-    source = ROOT / "datasets/初赛规则集rules1.json"
+    source = ROOT / "data/raw/初赛规则集rules1.json"
     raw = json.loads(source.read_text(encoding="utf-8"))
     rules = read_rules(source)
     units = RuleUnitBuilder().build(rules)
@@ -91,8 +100,8 @@ def test_rule_evidence_final_contract(fields):
 
 @pytest.mark.parametrize("dataset_name", ["preliminary", "semifinal"])
 def test_dataset_pipeline_records_provenance(dataset_name, tmp_path, stub_index_build):
-    source = ROOT / "datasets/初赛规则集rules1.json"
-    dataset = DatasetPipeline(embedding=Mock(), index_root=tmp_path).prepare(source, dataset_name=dataset_name)
+    source = ROOT / "data/raw/初赛规则集rules1.json"
+    dataset = DatasetPipeline(embedding=NonCallableMock(model="test-embedding"), index_root=tmp_path).prepare(source, dataset_name=dataset_name)
     units = list(dataset.units.values())
     assert len(units) == 800
     assert len(dataset.rules) == 800
@@ -120,7 +129,7 @@ def test_dataset_pipeline_preserves_builder_metadata_and_output(tmp_path, stub_i
         "rule_id": "1", "rule_text": "完整原文",
         "metadata": {"domain": {"name": "海洋"}, "topic": "规则主题"},
     }]), encoding="utf-8")
-    dataset = DatasetPipeline(embedding=Mock(), index_root=tmp_path, unit_builder=CustomBuilder()).prepare(
+    dataset = DatasetPipeline(embedding=NonCallableMock(model="test-embedding"), index_root=tmp_path, unit_builder=CustomBuilder()).prepare(
         source, dataset_name="preliminary",
     )
     units = list(dataset.units.values())

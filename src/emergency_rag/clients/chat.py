@@ -1,11 +1,12 @@
 """通用 Chat Completions 文本客户端，作答规则由调用方提供。"""
 
-import os
 from functools import cache
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat.completion_create_params import ResponseFormat
+
+from emergency_rag.settings import settings
 
 
 class ChatClient:
@@ -48,14 +49,14 @@ class ChatClient:
 @cache
 def get_chat_client() -> ChatClient:
     """共享作答 SDK；检索加载不调用它，提示词与返回格式仍属于用例。"""
-    api_key = os.environ.get("RAG_CHAT_API_KEY")
-    model = os.environ.get("RAG_CHAT_MODEL")
+    api_key = settings.chat_api_key
+    model = settings.chat_model
     if not api_key or not model:
-        raise ValueError("请设置 RAG_CHAT_API_KEY 和 RAG_CHAT_MODEL")
+        raise ValueError("请配置 RAG_CHAT_API_KEY 和 settings.chat_model")
 
     return ChatClient(OpenAI(
         api_key=api_key,
-        base_url=os.environ.get("RAG_CHAT_BASE_URL"),
-        timeout=float(os.environ.get("RAG_CHAT_TIMEOUT", "60")),
-        max_retries=int(os.environ.get("RAG_CHAT_MAX_RETRIES", "2")),
+        base_url=settings.chat_base_url,
+        timeout=settings.chat_timeout,
+        max_retries=settings.chat_max_retries,
     ), model=model)

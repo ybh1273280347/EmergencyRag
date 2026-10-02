@@ -9,7 +9,7 @@ from emergency_rag.retrieval.rerank.base import Reranker as RerankerBase
 from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.models import Candidate, QueryContext, RuleEvidence
 from emergency_rag.retrieval.pipeline import RetrievalPipeline, aggregate_rule_evidence
-from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.units.base import UnitBuilder
 from emergency_rag.data.models import Rule
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 

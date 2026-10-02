@@ -6,6 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import warnings
+
+# 忽略包含该特定文本的警告
+warnings.filterwarnings("ignore", message=".*resource module not available on Windows.*")
+
 import bm25s
 import faiss
 import numpy as np
@@ -41,10 +46,15 @@ def dataset_index_directory(
     dataset_name: str,
     strategy: str,
     tokenizer_name: str,
+    embedding_model: str,
 ) -> Path:
     """准备与构建共用的目录命名规则，在读取原始文件前即可确定位置。"""
+    # 模型 ID 可以包含命名空间斜杠等字符，目录中转为单个安全名称。
+    model_name = re.sub(r"[^A-Za-z0-9._-]+", "-", embedding_model).strip("-.")
+    if not model_name:
+        raise ValueError("Embedding 模型名不能生成有效索引目录")
     return (
-        Path(index_root) / f"{dataset_name}-{strategy}-{tokenizer_name}"
+        Path(index_root) / f"{dataset_name}-{strategy}-{tokenizer_name}-{model_name}"
     ).resolve()
 
 

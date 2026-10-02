@@ -13,10 +13,11 @@ from emergency_rag.retrieval.fusion.base import Fusion
 from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.pipeline import RetrievalPipeline
 from emergency_rag.retrieval.query.base import QueryProcessor
+from emergency_rag.retrieval.query.cached import CachedQueryProcessor
 from emergency_rag.retrieval.rerank.base import Reranker
 from emergency_rag.retrieval.retrievers.base import Retriever
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
-from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.units.base import UnitBuilder
 
 
 class PipelineConfigError(ValueError):
@@ -208,9 +209,10 @@ def load_pipeline(config_path: str | Path) -> RetrievalPipeline:
     if not index_root.is_absolute():
         index_root = path.parent / index_root
 
-    # Dataset 构建与注册的 Dense 工厂取得同一个模块级 EmbeddingClient。
+    # 缓存加载不创建 Embedding；实际构建时与 Dense 工厂取得同一个共享客户端。
     preparation = DatasetPipeline(
-        embedding=embedding.get_embedding_client(),
+        embedding=embedding.get_embedding_client,
+        embedding_model=embedding.settings.embedding_model,
         index_root=index_root.resolve(),
         **dataset_kwargs,
     )
@@ -220,4 +222,10 @@ def load_pipeline(config_path: str | Path) -> RetrievalPipeline:
         overwrite=dataset_config["overwrite"],
     )
 
+    # 查询处理缓存是固定行为；策略名称包含模型与提示词版本时会自动隔离。
+    processor = retrieval_kwargs.get("query_processor", QueryProcessor())
+    retrieval_kwargs["query_processor"] = CachedQueryProcessor(
+        processor,
+        directory=embedding.settings.query_cache_root / "query_processing" / processor.name,
+    )
     return RetrievalPipeline(dataset=dataset, **retrieval_kwargs)

@@ -187,7 +187,7 @@ def build_dataset_indexes(
     embedding: EmbeddingClient,
     overwrite: bool = False,
 ) -> Path:
-    """按数据集、单元构建和分词策略确定目录，固定构建 BM25 和 Dense。
+    """按数据集、单元构建、分词策略和 Embedding 模型确定目录，构建双路索引。
 
     rules.json、units.json 与索引整体构建成功后才替换旧目录。
     在线 IndexedDataset 只读取这些产物，不依赖构建说明。
@@ -200,7 +200,7 @@ def build_dataset_indexes(
     if any(unit.rule_id not in rule_ids for unit in units):
         raise ValueError("SearchUnit 指向不存在的规则")
 
-    # 目录由数据集、单元构建策略和分词器共同决定
+    # 目录包含实际生成文档向量的模型名，切换模型会选中新的产物目录。
     dataset_name = units[0].metadata.get("dataset")
     unit_builder = units[0].metadata.get("unit_builder")
     strategy = (
@@ -213,6 +213,7 @@ def build_dataset_indexes(
         dataset_name,
         strategy,
         tokenizer.name,
+        embedding.model,
     )
 
     # 同次构建必须来自同一数据集和单元构建策略

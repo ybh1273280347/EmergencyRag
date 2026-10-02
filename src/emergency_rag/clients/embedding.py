@@ -1,10 +1,14 @@
 """Embedding API 边界：批量、顺序恢复及响应校验，不拥有索引构建。"""
 
-import os
+import re
 from functools import cache
+from pathlib import Path
 
 import numpy as np
 from openai import APIError, OpenAI
+
+from emergency_rag.cache import JsonFileCache
+from emergency_rag.settings import settings
 
 
 class EmbeddingError(RuntimeError):
@@ -21,9 +25,75 @@ class EmbeddingClient:
         self.model = model
         self.batch_size = batch_size
         self.client = client
+        self._query_caches: dict[Path, JsonFileCache] = {}  # 按缓存路径复用实例
 
     def embed(self, text: str) -> np.ndarray:
         return self.embed_batch([text])[0]  # 单条文本复用批量接口
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        cache_directory: Path | None = None,
+        refresh: bool = False,
+    ) -> np.ndarray:
+        """仅缓存在线查询向量；离线文档仍使用 embed_batch，不混用缓存。"""
+        if cache_directory is None:
+            cache_directory = settings.query_cache_root / "query_embeddings"
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Embedding 输入必须为非空文本")
+
+        # 模型名转义为安全的目录名，避免非法字符
+        model_directory = re.sub(r"[^A-Za-z0-9._-]+", "-", self.model).strip("-.")
+        if not model_directory:
+            raise EmbeddingError("Embedding 模型名不能生成有效缓存目录")
+
+        path = (Path(cache_directory) / model_directory / "embeddings.json").resolve()
+        if path not in self._query_caches:
+            self._query_caches[path] = JsonFileCache(path)
+        cache = self._query_caches[path]
+
+        # 缓存已存在时必须与当前模型一致
+        if cache.data and cache.data.get("model") != self.model:
+            raise EmbeddingError("查询向量缓存的模型与当前模型不一致，请选择新的缓存目录")
+
+        queries = cache.data.get("queries", {})
+        if not isinstance(queries, dict):
+            raise EmbeddingError("查询向量缓存缺少有效 queries 对象")
+
+        hit = text in queries and not refresh
+        try:
+            vector = (
+                np.asarray(queries[text], dtype=np.float32)
+                if hit
+                else self.embed(text)
+            )
+        except (TypeError, ValueError) as exc:
+            raise EmbeddingError("查询向量缓存格式无效") from exc
+
+        # 查询向量必须为一维、非零、有限
+        if (
+            vector.ndim != 1
+            or not vector.size
+            or not np.isfinite(vector).all()
+            or not np.any(vector)
+        ):
+            raise EmbeddingError("查询向量必须为非零且有限的一维向量")
+
+        # 已存在的缓存维度必须与新向量一致
+        if cache.data and cache.data.get("dimension") != vector.size:
+            raise EmbeddingError("查询向量维度与缓存不一致，请选择新的缓存目录")
+
+        if not hit:
+            cache.save({
+                "model": self.model,
+                "dimension": int(vector.size),
+                "queries": {**queries, text: vector.tolist()},
+            })
+
+        # FAISS 会原地归一化查询向量，返回独立数组以免影响后续命中
+        return vector.copy()
 
     def embed_batch(self, texts: list[str]) -> np.ndarray:
         if not texts:
@@ -93,16 +163,16 @@ class EmbeddingClient:
 @cache
 def get_embedding_client() -> EmbeddingClient:
     """首次使用时创建进程共享的模型实例，离线与在线使用同一配置。"""
-    api_key = os.environ.get("RAG_EMBEDDING_API_KEY")
-    model = os.environ.get("RAG_EMBEDDING_MODEL")
+    api_key = settings.embedding_api_key
+    model = settings.embedding_model
 
     if not api_key or not model:
-        raise ValueError("请设置 RAG_EMBEDDING_API_KEY 和 RAG_EMBEDDING_MODEL")
+        raise ValueError("请配置 RAG_EMBEDDING_API_KEY 和 settings.embedding_model")
 
     client = OpenAI(
         api_key=api_key,
-        base_url=os.environ.get("RAG_EMBEDDING_BASE_URL"),
-        timeout=float(os.environ.get("RAG_EMBEDDING_TIMEOUT", "60")),
-        max_retries=int(os.environ.get("RAG_EMBEDDING_MAX_RETRIES", "2")),
+        base_url=settings.embedding_base_url,
+        timeout=settings.embedding_timeout,
+        max_retries=settings.embedding_max_retries,
     )
     return EmbeddingClient(client, model=model)

@@ -6,8 +6,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
-data/indexes/
-data/.indexes-*/
 *.egg-info/
 dist/
 build/
+backup/

@@ -4,11 +4,10 @@ import httpx
 import numpy as np
 import pytest
 from openai import AuthenticationError, OpenAI
-from zeroentropy import ZeroEntropy
 
 from emergency_rag.clients.chat import ChatClient
 from emergency_rag.clients.embedding import EmbeddingClient, EmbeddingError
-from emergency_rag.retrieval.rerank.zero_entropy import ZeroEntropyReranker, ZeroEntropyRerankerError
+from emergency_rag.retrieval.rerank.qwen import QwenReranker, QwenRerankerError
 
 
 def test_embedding_batches_restore_order():
@@ -86,6 +85,7 @@ def test_rerank_batch_alignment_and_full_scores(candidate):
 
     def respond(request):
         body = json.loads(request.content)
+        assert request.url.path == "/v1/rerank"
         calls.append(body)
         scores = [0.1, 0.9] if len(calls) == 1 else [0.7]
         return httpx.Response(200, json={"results": [
@@ -94,8 +94,8 @@ def test_rerank_batch_alignment_and_full_scores(candidate):
         ]})
 
     originals = [candidate("a"), candidate("b"), candidate("c")]
-    with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
-        reranker = ZeroEntropyReranker(sdk, model="test-reranker", instruction="评估相关性", batch_size=2)
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        reranker = QwenReranker(sdk, model="test-reranker", instruction="评估相关性", batch_size=2)
         assert reranker.rerank("问题", []) == []
         results = reranker.rerank("<危险&事故>", originals)
     assert [item.unit_id for item in results] == ["b", "c", "a"]
@@ -103,11 +103,15 @@ def test_rerank_batch_alignment_and_full_scores(candidate):
     assert all("final_rank" not in item.model_dump() for item in results)
     assert all(item.final_score is None for item in originals)
     assert [body["top_n"] for body in calls] == [2, 1]
-    assert "&lt;危险&amp;事故&gt;" in calls[0]["query"]
+    assert calls[0]["query"] == "<Instruct>: 评估相关性\n<Query>: <危险&事故>"
 
 
 @pytest.mark.parametrize("results", [
     None, [],
+    ["invalid"],
+    [{"index": True, "relevance_score": 0.5}],
+    [{"index": 0, "relevance_score": True}],
+    [{"index": 0}],
     [{"index": 1, "relevance_score": 0.5}],
     [{"index": 0, "relevance_score": 0.5}, {"index": 0, "relevance_score": 0.6}],
     [{"index": 0, "relevance_score": -0.1}],
@@ -119,9 +123,9 @@ def test_rerank_invalid_response(candidate, results):
     def respond(request):
         return httpx.Response(200, text=json.dumps({"results": results}))
 
-    with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
-        with pytest.raises(ZeroEntropyRerankerError):
-            ZeroEntropyReranker(sdk, model="test-reranker", instruction="评估相关性").rerank("问题", [candidate("a")])
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        with pytest.raises(QwenRerankerError):
+            QwenReranker(sdk, model="test-reranker", instruction="评估相关性").rerank("问题", [candidate("a")])
 
 
 def test_rerank_ties_and_duplicate_input(candidate):
@@ -130,20 +134,46 @@ def test_rerank_ties_and_duplicate_input(candidate):
             {"index": 0, "relevance_score": 0.5}, {"index": 1, "relevance_score": 0.5},
         ]})
 
-    with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
-        reranker = ZeroEntropyReranker(sdk, model="test-reranker", instruction="评估相关性")
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        reranker = QwenReranker(sdk, model="test-reranker", instruction="评估相关性")
         assert [item.unit_id for item in reranker.rerank("问题", [candidate("b"), candidate("a")])] == ["a", "b"]
         with pytest.raises(ValueError, match="重复"):
             reranker.rerank("问题", [candidate("a"), candidate("a")])
+
+
+def test_rerank_plain_query_and_sdk_retry(candidate):
+    calls = []
+
+    def respond(request):
+        calls.append(json.loads(request.content))
+        if len(calls) == 1:
+            return httpx.Response(503, json={"error": {"message": "temporary"}})
+        return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.8}]})
+
+    with OpenAI(api_key="test", max_retries=1, http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+        result = QwenReranker(sdk, model="test-reranker").rerank("原始问题", [candidate("a")])
+    assert len(calls) == 2
+    assert all(body["query"] == "原始问题" for body in calls)
+    assert all("instruction" not in body for body in calls)
+    assert result[0].final_score == 0.8
+
+
+def test_rerank_rejects_invalid_json(candidate):
+    transport = httpx.MockTransport(lambda request: httpx.Response(
+        200, headers={"content-type": "application/json"}, text="not json",
+    ))
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=transport)) as sdk:
+        with pytest.raises(QwenRerankerError, match="JSON"):
+            QwenReranker(sdk, model="test-reranker").rerank("问题", [candidate("a")])
 
 
 @pytest.mark.parametrize("client_kind", ["embedding", "rerank", "chat"])
 def test_api_errors_have_clear_boundary(candidate, client_kind):
     transport = httpx.MockTransport(lambda request: httpx.Response(401, json={"error": {"message": "unauthorized"}}))
     if client_kind == "rerank":
-        with ZeroEntropy(api_key="test", max_retries=0, http_client=httpx.Client(transport=transport)) as sdk:
-            with pytest.raises(ZeroEntropyRerankerError, match="API 调用失败"):
-                ZeroEntropyReranker(sdk, model="test-reranker", instruction="评估相关性").rerank("问题", [candidate("a")])
+        with OpenAI(api_key="test", max_retries=0, http_client=httpx.Client(transport=transport)) as sdk:
+            with pytest.raises(QwenRerankerError, match="API 调用失败"):
+                QwenReranker(sdk, model="test-reranker", instruction="评估相关性").rerank("问题", [candidate("a")])
     else:
         with OpenAI(api_key="test", max_retries=0, http_client=httpx.Client(transport=transport)) as sdk:
             if client_kind == "embedding":

@@ -8,14 +8,21 @@ version = "0.1.0"
 description = "Component-based emergency rule retrieval"
 requires-python = ">=3.11"
 dependencies = [
+    "bcembedding>=0.1.5",
     "bm25s>=0.2.14,<0.3",
     "faiss-cpu>=1.10,<2",
     "jieba>=0.42.1,<0.43",
     "numpy>=1.26,<3",
     "openai>=1.60,<3",
+    "protobuf>=7.36.2",
     "pydantic>=2.10,<3",
+    "python-dotenv>=1,<2",
     "pyyaml>=6,<7",
-    "zeroentropy>=0.1.0a11,<0.2",
+    "safetensors>=0.8.0",
+    "sentencepiece>=0.2.2",
+    "torch>=2.5.1",
+    "torchvision>=0.20.1",
+    "typesafe-sdk>=0.7.2,<0.8",
 ]
 
 [dependency-groups]
@@ -31,3 +38,11 @@ pythonpath = ["."]
 addopts = "-ra --basetemp=.pytest_cache/tmp"
 
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }

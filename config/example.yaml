@@ -1,4 +1,4 @@
-# 模型连接、模型名、超时和重试由对应模块读取环境配置，YAML 只声明实验参数。
+# 直接验证检索与作答：默认重排器原样返回，不请求重排模型。
 dataset:
   source: ../data/raw/初赛规则集rules1.json
   dataset_name: preliminary
@@ -12,9 +12,6 @@ retrieval:
     - name: bm25
       params:
         top_k: 30
-    - name: dense
-      params:
-        top_k: 30
   fusion:
     name: rrf
     params:
@@ -25,7 +22,3 @@ retrieval:
     params:
       model_path: models/bce-reranker-base_v1
       batch_size: 32
-  # 未声明的可选阶段使用 Pipeline 默认组件；可以显式声明以下名称。
-  query_processor: default
-  expander: default
-  gate: default

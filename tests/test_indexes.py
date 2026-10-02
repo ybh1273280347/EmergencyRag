@@ -7,19 +7,18 @@ import numpy as np
 import pytest
 import yaml
 from openai import OpenAI
-from zeroentropy import ZeroEntropy
 
 from emergency_rag.clients.embedding import EmbeddingClient, EmbeddingError
 from emergency_rag.clients.chat import ChatClient
-from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.units.base import UnitBuilder
 from emergency_rag.data.models import IndexedDataset, Rule, SearchUnit
 from emergency_rag.data.pipeline import DatasetPipeline
-from emergency_rag.unit_building.rule import RuleUnitBuilder
+from emergency_rag.units.rule import RuleUnitBuilder
 from emergency_rag.retrieval.fusion.rrf import RRFFusion
 from emergency_rag.retrieval.fusion.union import UnionFusion
 from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.pipeline import RetrievalPipeline
-from emergency_rag.retrieval.rerank.zero_entropy import ZeroEntropyReranker
+from emergency_rag.retrieval.rerank.qwen import QwenReranker
 from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
 from emergency_rag.retrieval.retrievers.dense import DenseRetriever
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
@@ -30,7 +29,7 @@ from emergency_rag.data.indexing import (
 )
 from emergency_rag.data.pipeline import read_rules
 from emergency_rag.load_pipeline import load_pipeline
-from examples.preliminary_experiment import run_experiment
+from examples.chat_experiment import run_experiment
 
 
 @pytest.fixture
@@ -147,7 +146,7 @@ def test_query_never_rebuilds_or_rereads_indexes(built_indexes, monkeypatch):
     for _ in range(2):
         assert sparse.retrieve("海冰", dataset)[0].rule_id == "2"
         assert dense.retrieve("海冰", dataset)[0].rule_id == "2"
-    assert [call["input"] for call in calls] == [["海冰"], ["海冰"]]
+    assert [call["input"] for call in calls] == [["海冰"]]  # 第二次查询直接复用向量。
 
 
 @pytest.mark.parametrize("vectors,dimension", [
@@ -245,19 +244,19 @@ def test_pipeline_top_k_does_not_change_recall_or_rerank(built_indexes, fusion):
             for i in reversed(range(len(body["documents"])))
         ]})
 
-    with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
         pipeline = RetrievalPipeline(
             dataset=dataset,
             retrievers=(BM25Retriever(), DenseRetriever(embedding)),
             fusion=fusion,
-            reranker=ZeroEntropyReranker(client=sdk, model="test", instruction="评估相关性"),
+            reranker=QwenReranker(client=sdk, model="test", instruction="评估相关性"),
         )
         result = pipeline.retrieve("海冰", top_k=1)
         expanded_result = pipeline.retrieve("海冰", top_k=2)
     count = result.metadata["candidate_counts"]["fusion"]
     assert count == (1 if fusion.name == "rrf" else 3)
     assert [call["top_n"] for call in rerank_calls] == [count, count]
-    assert [call["input"] for call in embedding_calls] == [["海冰"], ["海冰"]]
+    assert [call["input"] for call in embedding_calls] == [["海冰"]]
     assert expanded_result.metadata["retrieval_counts"] == result.metadata["retrieval_counts"]
     assert expanded_result.metadata["candidate_counts"]["fusion"] == count
     assert len(expanded_result.evidence) == min(2, count)
@@ -266,7 +265,7 @@ def test_pipeline_top_k_does_not_change_recall_or_rerank(built_indexes, fusion):
 
 
 def test_bm25_only_dataset_requires_no_model_or_dense_index(tmp_path):
-    source = Path(__file__).resolve().parents[1] / "datasets/初赛规则集rules1.json"
+    source = Path(__file__).resolve().parents[1] / "data/raw/初赛规则集rules1.json"
     rules = read_rules(source)
     units = RuleUnitBuilder().build(rules)
     directory = tmp_path / "bm25_only"
@@ -331,7 +330,7 @@ def test_caller_selected_units_are_indexed_and_restore_full_rule(tmp_path):
         ).prepare(source, dataset_name="preliminary")
         directory = dataset.directory
         units = list(dataset.units.values())
-    assert directory == tmp_path / "preliminary-sentence-jieba"
+    assert directory == tmp_path / "preliminary-sentence-jieba-test-embedding"
     assert (directory / "bm25/unit_ids.json").is_file()
     assert (directory / "dense/faiss.index").is_file()
     dataset = IndexedDataset(directory, tokenizer=JiebaTokenizer())
@@ -351,13 +350,18 @@ def test_caller_selected_units_are_indexed_and_restore_full_rule(tmp_path):
 
 def test_index_directory_is_determined_by_unit_provenance(built_indexes):
     units, embedding, directory, calls = built_indexes
-    assert directory.name == "preliminary-rule-jieba"
+    assert directory.name == "preliminary-rule-jieba-test-embedding"
     assert (directory / "bm25/unit_ids.json").is_file()
     assert (directory / "dense/faiss.index").is_file()
     notes = json.loads((directory / "index_meta.json").read_text(encoding="utf-8"))
     assert notes["dataset"] == "preliminary"
     assert notes["unit_builder"] == {"strategy": "rule"}
     assert notes["tokenizer"] == {"strategy": "jieba"}
+    assert notes["embedding_model"] == embedding.model
+    assert notes["embedding_dimension"] == 3
+    dense_notes = json.loads((directory / "dense/index_meta.json").read_text(encoding="utf-8"))
+    assert dense_notes["embedding_model"] == notes["embedding_model"]
+    assert dense_notes["embedding_dimension"] == notes["embedding_dimension"]
     assert notes["document_count"] == 3
     assert notes["rule_count"] == 3
     assert all(unit.metadata["unit_builder"] == {"strategy": "rule"} for unit in IndexedDataset(directory, tokenizer=JiebaTokenizer()).units.values())
@@ -382,6 +386,44 @@ def test_dataset_pipeline_loads_existing_directory_before_reading_rules(built_in
     assert calls == []
 
 
+def test_embedding_model_switch_builds_separate_directory(built_indexes):
+    units, embedding, directory, calls = built_indexes
+    alternate_embedding = EmbeddingClient(embedding.client, model="other-embedding")
+    preparation = DatasetPipeline(embedding=alternate_embedding, index_root=directory.parent)
+    alternate = preparation.prepare(directory.parent / "rules.json", dataset_name="preliminary")
+    assert alternate.directory.name == "preliminary-rule-jieba-other-embedding"
+    assert directory.is_dir() and alternate.directory != directory
+    notes = json.loads((alternate.directory / "index_meta.json").read_text(encoding="utf-8"))
+    assert notes["embedding_model"] == "other-embedding"
+    assert len(calls) == 1 and calls[0]["model"] == "other-embedding"
+    calls.clear()
+    cached = preparation.prepare(directory.parent / "missing.json", dataset_name="preliminary")
+    assert cached.directory == alternate.directory and calls == []
+
+
+def test_embedding_factory_cache_lookup_does_not_create_client(built_indexes):
+    units, embedding, directory, calls = built_indexes
+
+    def fail():
+        raise AssertionError("读取模型对应缓存不能创建客户端")
+
+    cached = DatasetPipeline(
+        embedding=fail, embedding_model=embedding.model, index_root=directory.parent,
+    ).prepare(directory.parent / "missing.json", dataset_name="preliminary")
+    assert cached.directory == directory and calls == []
+
+
+def test_embedding_factory_model_declaration_matches_build(built_indexes):
+    units, embedding, directory, calls = built_indexes
+    preparation = DatasetPipeline(
+        embedding=lambda: embedding, embedding_model="different-model", index_root=directory.parent,
+    )
+    with pytest.raises(ValueError, match="实际模型"):
+        preparation.prepare(directory.parent / "rules.json", dataset_name="preliminary")
+    assert not (directory.parent / "preliminary-rule-jieba-different-model").exists()
+    assert calls == []
+
+
 def test_dataset_pipeline_builds_missing_directory_and_returns_searchable_dataset(built_indexes, tmp_path):
     units, embedding, directory, calls = built_indexes
     source = tmp_path / "source.json"
@@ -390,7 +432,7 @@ def test_dataset_pipeline_builds_missing_directory_and_returns_searchable_datase
     ]), encoding="utf-8")
     pipeline = DatasetPipeline(embedding=embedding, index_root=tmp_path / "new-indexes")
     dataset = pipeline.prepare(source, dataset_name="semifinal")
-    assert dataset.directory == tmp_path / "new-indexes/semifinal-rule-jieba"
+    assert dataset.directory == tmp_path / "new-indexes/semifinal-rule-jieba-test-embedding"
     assert (dataset.directory / "bm25/unit_ids.json").is_file()
     assert (dataset.directory / "dense/faiss.index").is_file()
     assert [call["input"] for call in calls] == [[unit.text for unit in units]]
@@ -451,7 +493,7 @@ def test_tokenizer_is_carried_from_build_through_cache_to_bm25(built_indexes, tm
     tokenizer = WholeTextTokenizer()
     preparation = DatasetPipeline(embedding=embedding, index_root=tmp_path, tokenizer=tokenizer)
     dataset = preparation.prepare(source, dataset_name="preliminary")
-    assert dataset.directory.name == "preliminary-rule-whole-text"
+    assert dataset.directory.name == "preliminary-rule-whole-text-test-embedding"
     assert dataset.tokenizer is tokenizer
     assert tokenizer.observed == [unit.text for unit in units]
     retriever = BM25Retriever()
@@ -489,7 +531,7 @@ def test_different_tokenizers_select_different_index_directories(built_indexes, 
     alternate = DatasetPipeline(embedding=embedding, index_root=directory.parent, tokenizer=tokenizer).prepare(
         source, dataset_name="preliminary",
     )
-    assert alternate.directory.name == "preliminary-rule-characters"
+    assert alternate.directory.name == "preliminary-rule-characters-test-embedding"
     assert alternate.directory != directory
     assert (alternate.directory / "bm25/unit_ids.json").is_file()
     assert (alternate.directory / "dense/faiss.index").is_file()
@@ -542,6 +584,7 @@ def test_experiment_prepares_retrieves_and_answers(built_indexes, monkeypatch, q
         },
     }), encoding="utf-8")
     monkeypatch.setattr("emergency_rag.clients.embedding.get_embedding_client", lambda: embedding)
+    monkeypatch.setattr("emergency_rag.clients.embedding.settings.embedding_model", embedding.model)
     pipeline = load_pipeline(config_path)
     requests = []
 
@@ -636,11 +679,11 @@ def test_enhanced_text_indexes_units_but_reranks_original_and_returns_rules(tmp_
         assert all("应急终止" not in unit.text for unit in dataset.units.values())
         sparse = BM25Retriever()
         assert sparse.retrieve("应急终止", dataset)[0].rule_id == "37"
-        with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(rerank))) as rerank_sdk:
+        with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(rerank))) as rerank_sdk:
             pipeline = RetrievalPipeline(
                 dataset=dataset, retrievers=[sparse, DenseRetriever(embedding)],
                 fusion=RRFFusion(),
-                reranker=ZeroEntropyReranker(rerank_sdk, model="test-reranker", instruction="", batch_size=2),
+                reranker=QwenReranker(rerank_sdk, model="test-reranker", instruction="", batch_size=2),
                 gate=Gate(),
             )
             result = pipeline.retrieve("应急终止", top_k=2)

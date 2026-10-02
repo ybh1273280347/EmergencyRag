@@ -5,10 +5,11 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
+from dotenv import find_dotenv
 from openai import OpenAI
-from zeroentropy import ZeroEntropy
 
 from emergency_rag.clients import chat, embedding
+from emergency_rag import settings as settings_module
 from emergency_rag.data.models import SearchUnit
 from emergency_rag.data.pipeline import DatasetPipeline
 from emergency_rag.load_pipeline import PipelineConfigError, load_pipeline
@@ -17,9 +18,9 @@ from emergency_rag.retrieval.fusion.base import Fusion
 from emergency_rag.retrieval.fusion.union import UnionFusion
 from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.query.base import QueryProcessor
-from emergency_rag.retrieval.rerank import zero_entropy
+from emergency_rag.retrieval.rerank import bce, qwen
 from emergency_rag.retrieval.rerank.base import Reranker
-from emergency_rag.unit_building.base import UnitBuilder
+from emergency_rag.units.base import UnitBuilder
 
 
 class EnhancedUnitBuilder(UnitBuilder):
@@ -45,7 +46,7 @@ class FirstFusion(Fusion):
 @pytest.fixture(autouse=True)
 def isolate_model_cache():
     # 模型缓存属于进程，测试之间显式释放连接，避免配置和实例串用。
-    getters = (embedding.get_embedding_client, chat.get_chat_client, zero_entropy.get_rerank_model)
+    getters = (embedding.get_embedding_client, chat.get_chat_client, qwen.get_rerank_model)
     for getter in getters:
         getter.cache_clear()
     yield
@@ -84,6 +85,7 @@ def experiment_yaml(tmp_path, monkeypatch):
 
     with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
         model = embedding.EmbeddingClient(sdk, model="test-embedding")
+        monkeypatch.setattr(embedding.settings, "embedding_model", model.model)
         monkeypatch.setattr(embedding, "get_embedding_client", lambda: model)
         yield directory / "pipeline.yaml", config, model, calls
 
@@ -101,12 +103,13 @@ def test_yaml_builds_indexes_and_shares_embedding_through_cache(experiment_yaml,
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     pipeline = load_pipeline(path)
-    assert pipeline.dataset.directory == path.parent / "indexes/preliminary-rule-jieba"
+    assert pipeline.dataset.directory == path.parent / "indexes/preliminary-rule-jieba-test-embedding"
     assert all((pipeline.dataset.directory / name).is_file() for name in (
         "rules.json", "units.json", "bm25/unit_ids.json", "dense/faiss.index",
     ))
-    assert prepared_embeddings[0] is pipeline.retrievers[1].embedding is model
-    assert type(pipeline.query_processor) is QueryProcessor
+    assert prepared_embeddings[0] is embedding.get_embedding_client
+    assert pipeline.retrievers[1].embedding is model
+    assert type(pipeline.query_processor.processor) is QueryProcessor
     assert type(pipeline.reranker) is Reranker
     assert type(pipeline.gate) is EvidenceGate
     assert calls[0]["input"] == ["条件甲及完整说明", "海冰观测频率"]
@@ -126,8 +129,45 @@ def test_yaml_builds_indexes_and_shares_embedding_through_cache(experiment_yaml,
     assert cached.dataset.rules == pipeline.dataset.rules
     assert cached.dataset.units == pipeline.dataset.units
     assert calls == []
-    assert prepared_embeddings[1] is cached.retrievers[1].embedding is model
+    assert prepared_embeddings[1] is embedding.get_embedding_client
+    assert cached.retrievers[1].embedding is model
     assert cached.retrieve("条件甲").evidence[0].rule_id == "1"
+
+
+def test_cached_bm25_pipeline_needs_no_embedding_client(experiment_yaml, monkeypatch):
+    path, config, model, calls = experiment_yaml
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    built = load_pipeline(path)
+    config["retrieval"]["retrievers"] = [{"name": "bm25", "params": {"top_k": 2}}]
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    (path.parent / "rules.json").unlink()
+    calls.clear()
+
+    def fail():
+        raise AssertionError("缓存中的纯 BM25 检索不得获取 Embedding 客户端")
+
+    monkeypatch.setattr(embedding, "get_embedding_client", fail)
+    cached = load_pipeline(path)
+    result = cached.retrieve("条件甲", top_k=1)
+    assert result.evidence[0].rule_id == "1"
+    assert cached.dataset.rules == built.dataset.rules
+    assert result.metadata["active_retrievers"] == ["bm25"]
+    assert calls == []
+
+
+def test_bm25_cache_miss_still_requires_embedding_for_dual_index_build(experiment_yaml, monkeypatch):
+    path, config, model, calls = experiment_yaml
+    config["retrieval"]["retrievers"] = [{"name": "bm25"}]
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    def fail():
+        raise ValueError("缺少文档 Embedding 配置")
+
+    monkeypatch.setattr(embedding, "get_embedding_client", fail)
+    with pytest.raises(ValueError, match="缺少文档 Embedding 配置"):
+        load_pipeline(path)
+    assert not (path.parent / "indexes/preliminary-rule-jieba-test-embedding").exists()
+    assert calls == []
 
 
 def test_yaml_custom_registered_components(experiment_yaml, monkeypatch):
@@ -138,7 +178,7 @@ def test_yaml_custom_registered_components(experiment_yaml, monkeypatch):
     config["retrieval"]["fusion"] = "first"
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     pipeline = load_pipeline(path)
-    assert pipeline.dataset.directory.name == "preliminary-context-jieba"
+    assert pipeline.dataset.directory.name == "preliminary-context-jieba-test-embedding"
     assert calls[0]["input"] == ["应急终止 条件甲及完整说明", "应急终止 海冰观测频率"]
     result = pipeline.retrieve("应急终止 条件甲", top_k=1)
     assert result.evidence[0].matched_units[0].unit_id == "sub_rule:1:1"
@@ -159,9 +199,11 @@ def test_yaml_switches_fusion_and_keeps_model_instance(experiment_yaml):
     assert second.retrieve("条件甲", top_k=2).metadata["candidate_counts"] == {"fusion": 2, "rules": 2, "final": 2}
 
 
-def test_shipped_baseline_and_independent_rerank_instructions(experiment_yaml, monkeypatch):
+def test_shipped_qwen_and_independent_rerank_instructions(experiment_yaml, monkeypatch):
     path, config, model, calls = experiment_yaml
-    baseline = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/baseline.yaml").read_text(encoding="utf-8"))
+    baseline = {**config, "retrieval": {**config["retrieval"], "reranker": {
+        "name": "qwen", "params": {"instruction": "请评估规则片段与问题的相关性。", "batch_size": 64},
+    }}}
     baseline["dataset"] = config["dataset"]
     rerank_calls = []
 
@@ -173,12 +215,12 @@ def test_shipped_baseline_and_independent_rerank_instructions(experiment_yaml, m
             for i in reversed(range(len(body["documents"])))
         ]})
 
-    with ZeroEntropy(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
+    with OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as sdk:
         @cache
         def get_model(**params):
-            return zero_entropy.ZeroEntropyReranker(sdk, model="test-reranker", **params)
+            return qwen.QwenReranker(sdk, model="test-reranker", **params)
 
-        monkeypatch.setattr(zero_entropy, "get_rerank_model", get_model)
+        monkeypatch.setattr(qwen, "get_rerank_model", get_model)
         path.write_text(yaml.safe_dump(baseline), encoding="utf-8")
         pipeline = load_pipeline(path)
         result = pipeline.retrieve("条件甲", top_k=1)
@@ -193,6 +235,26 @@ def test_shipped_baseline_and_independent_rerank_instructions(experiment_yaml, m
         assert load_pipeline(path).reranker is second.reranker
         assert pipeline.reranker.instruction == "请评估规则片段与问题的相关性。"
         assert second.reranker.instruction == "另一实验指令"
+
+
+def test_shipped_baseline_loads_bce_without_qwen_credentials(experiment_yaml, monkeypatch):
+    from unittest.mock import Mock
+
+    path, config, embedding_model, calls = experiment_yaml
+    baseline = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/baseline.yaml").read_text(encoding="utf-8"))
+    baseline["dataset"] = config["dataset"]
+    model = Mock()
+    model.rerank.return_value = {"rerank_ids": [1, 0], "rerank_scores": [0.9, 0.1]}
+    reranker = bce.BCEReranker(model)
+    getter = Mock(return_value=reranker)
+    monkeypatch.setattr(bce, "get_rerank_model", getter)
+    path.write_text(yaml.safe_dump(baseline), encoding="utf-8")
+    pipeline = load_pipeline(path)
+    assert pipeline.reranker is reranker
+    getter.assert_called_once_with(model_path="models/bce-reranker-base_v1", batch_size=32)
+    result = pipeline.retrieve("条件甲", top_k=1)
+    assert result.metadata["reranker"] == "bce"
+    assert result.evidence[0].final_score == 0.9
 
 
 @pytest.mark.parametrize("invalid", [
@@ -249,18 +311,42 @@ def test_invalid_or_unsafe_yaml_tags_rejected(tmp_path, content):
 
 
 @pytest.mark.parametrize("kind", ["embedding", "rerank", "chat"])
-def test_module_models_created_once_from_environment(monkeypatch, kind):
-    prefix = {"embedding": "RAG_EMBEDDING", "rerank": "ZEROENTROPY", "chat": "RAG_CHAT"}[kind]
-    module = {"embedding": embedding, "rerank": zero_entropy, "chat": chat}[kind]
-    getter = {"embedding": embedding.get_embedding_client, "rerank": zero_entropy.get_rerank_model, "chat": chat.get_chat_client}[kind]
-    monkeypatch.setenv(f"{prefix}_API_KEY", "test-private-key")
-    monkeypatch.setenv(f"{prefix}_MODEL", "test-model")
-    url_variable = "ZEROENTROPY_URL" if kind == "rerank" else f"{prefix}_BASE_URL"
-    monkeypatch.setenv(url_variable, "https://model.example/v1")
-    monkeypatch.setenv(f"{prefix}_TIMEOUT", "12")
-    monkeypatch.setenv(f"{prefix}_MAX_RETRIES", "1")
+@pytest.mark.parametrize("configuration", ["environment", "dotenv"])
+def test_module_models_created_once_from_environment(monkeypatch, tmp_path, kind, configuration):
+    prefix = {"embedding": "RAG_EMBEDDING", "rerank": "QWEN_RERANKER", "chat": "RAG_CHAT"}[kind]
+    module = {"embedding": embedding, "rerank": qwen, "chat": chat}[kind]
+    getter = {"embedding": embedding.get_embedding_client, "rerank": qwen.get_rerank_model, "chat": chat.get_chat_client}[kind]
+    url_variable = f"{prefix}_BASE_URL"
+    variables = {
+        f"{prefix}_API_KEY": "test-private-key",
+        f"{prefix}_MODEL": "test-model",
+        url_variable: "https://model.example/v1",
+        f"{prefix}_TIMEOUT": "12",
+        f"{prefix}_MAX_RETRIES": "1",
+    }
+    if configuration == "environment":
+        for name, value in variables.items():
+            monkeypatch.setenv(name, value)
+    else:
+        # 使用真实查找逻辑，从子目录向上找到 UTF-8 BOM 的 .env。
+        for name in variables:
+            monkeypatch.delenv(name, raising=False)
+        nested = tmp_path / "experiments"
+        nested.mkdir()
+        monkeypatch.chdir(nested)
+        monkeypatch.setattr(settings_module, "find_dotenv", find_dotenv)
+        # 终端模型名优先，其他连接参数仍从文件自动加载。
+        monkeypatch.setenv(f"{prefix}_MODEL", "test-model")
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                f"{name}={'file-model' if name.endswith('_MODEL') else value}"
+                for name, value in variables.items()
+            ),
+            encoding="utf-8-sig",
+        )
+    monkeypatch.setattr(module, "settings", settings_module.Settings())
     constructors = []
-    sdk_class = ZeroEntropy if kind == "rerank" else OpenAI
+    sdk_class = OpenAI
 
     def construct(**kwargs):
         constructors.append(kwargs)
@@ -268,7 +354,7 @@ def test_module_models_created_once_from_environment(monkeypatch, kind):
             lambda request: httpx.Response(500),
         )), **kwargs)
 
-    monkeypatch.setattr(module, "ZeroEntropy" if kind == "rerank" else "OpenAI", construct)
+    monkeypatch.setattr(module, "OpenAI", construct)
     first = getter()
     assert getter() is first
     assert len(constructors) == 1
@@ -292,10 +378,58 @@ def test_module_models_created_once_from_environment(monkeypatch, kind):
 
 @pytest.mark.parametrize("getter,variable", [
     (embedding.get_embedding_client, "RAG_EMBEDDING_API_KEY"),
-    (zero_entropy.get_rerank_model, "ZEROENTROPY_API_KEY"),
+    (qwen.get_rerank_model, "QWEN_RERANKER_API_KEY"),
     (chat.get_chat_client, "RAG_CHAT_API_KEY"),
 ])
 def test_missing_environment_does_not_create_placeholder_model(getter, variable):
     with pytest.raises(ValueError, match=variable):
         getter()
     assert getter.cache_info().currsize == 0
+
+
+def test_settings_defaults_shared_instance_and_secret_repr(monkeypatch):
+    monkeypatch.setenv("RAG_EMBEDDING_API_KEY", "test-embedding-secret")
+    monkeypatch.setenv("QWEN_RERANKER_API_KEY", "test-rerank-secret")
+    monkeypatch.setenv("RAG_CHAT_API_KEY", "test-chat-secret")
+    configured = settings_module.Settings(
+        embedding_model="local-embedding", embedding_base_url="http://localhost:8000/v1",
+        qwen_reranker_model="local-reranker", chat_model="local-chat",
+    )
+    assert configured.embedding_model == "local-embedding"
+    assert configured.embedding_base_url == "http://localhost:8000/v1"
+    assert configured.qwen_reranker_model == "local-reranker"
+    assert configured.chat_model == "local-chat"
+    assert configured.embedding_timeout == 60 and configured.embedding_max_retries == 2
+    assert configured.embedding_api_key == "test-embedding-secret"
+    assert configured.qwen_reranker_api_key == "test-rerank-secret"
+    assert configured.chat_api_key == "test-chat-secret"
+    assert "secret" not in repr(configured)
+    assert embedding.settings is chat.settings is qwen.settings
+
+
+def test_qwen_reuses_embedding_connection_without_creating_embedding_model(monkeypatch):
+    monkeypatch.setenv("RAG_EMBEDDING_API_KEY", "test-shared-secret")
+    monkeypatch.setenv("RAG_EMBEDDING_BASE_URL", "https://shared.example/v1")
+    monkeypatch.setattr(qwen, "settings", settings_module.Settings())
+    constructors = []
+
+    def construct(**kwargs):
+        constructors.append(kwargs)
+        return OpenAI(http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(500),
+        )), **kwargs)
+
+    monkeypatch.setattr(qwen, "OpenAI", construct)
+    model = qwen.get_rerank_model(instruction="检索直接证据")
+    assert model.model == "qwen3-reranker-4b"
+    assert constructors[0]["api_key"] == "test-shared-secret"
+    assert constructors[0]["base_url"] == "https://shared.example/v1"
+    assert model.instruction == "检索直接证据"
+    model.client.close()
+
+
+def test_qwen_requires_rerank_endpoint(monkeypatch):
+    monkeypatch.setenv("QWEN_RERANKER_API_KEY", "test-secret")
+    monkeypatch.setattr(qwen, "settings", settings_module.Settings())
+    with pytest.raises(ValueError, match="QWEN_RERANKER_BASE_URL"):
+        qwen.get_rerank_model()

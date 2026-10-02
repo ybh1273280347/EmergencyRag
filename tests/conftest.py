@@ -8,13 +8,23 @@ import pytest
 
 from emergency_rag.retrieval.models import Candidate
 from emergency_rag.data.models import IndexedDataset, Rule
+from emergency_rag.clients import chat, choice_qa_client, embedding
+from emergency_rag.retrieval.rerank import qwen
+from emergency_rag import settings as settings_module
 
 
 @pytest.fixture(autouse=True)
-def isolate_environment_and_network(monkeypatch):
+def isolate_environment_and_network(monkeypatch, tmp_path):
+    # 默认测试不读取开发者的真实 .env；自动加载行为在临时目录中单独验证。
+    monkeypatch.setattr(settings_module, "find_dotenv", lambda **kwargs: "")
     for name in list(os.environ):
-        if name.startswith(("RAG_", "ZEROENTROPY_")):
+        if name.startswith(("RAG_", "QWEN_RERANKER_", "TYPESAFE_")):
             monkeypatch.delenv(name)
+
+    isolated = settings_module.Settings()
+    isolated.query_cache_root = tmp_path / "cache"
+    for module in (chat, choice_qa_client, embedding, qwen):
+        monkeypatch.setattr(module, "settings", isolated)
 
     def forbid_network(*args, **kwargs):
         raise AssertionError("pytest 禁止访问真实网络，请使用 MockTransport")

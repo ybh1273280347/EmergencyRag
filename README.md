@@ -1,270 +1,407 @@
-# Emergency-RAG Retrieval Core
+# Emergency-RAG：配置检索流水线与开展实验
 
-规则知识库的同步检索组件库。Rule 通过可插拔 UnitBuilder 生成 SearchUnit，离线使用增强文本构建双路索引。在线先对 Unit 召回和重排，再按 rule_id 聚合成完整规则证据。最终 Top-K 按规则计数，结果由调用方传给作答模型。
+本项目把规则数据准备和检索封装为可组合的流水线。实验通常只需配置 YAML、在 settings.py 填写模型参数、在 .env 填写密钥，再调用 `load_pipeline()`，就能得到可直接检索的对象。
 
-各阶段使用独立 ABC，简单参数直接通过构造函数注入。RetrievalPipeline 是 dataclass，Dataset 只注入一次。调用方可以直接装配，也可以通过 YAML 注册名称声明组件，由 load_pipeline 完成装配。组件不读取 YAML，模型模块负责共享实例和环境配置。
+项目自动完成规则读取、检索单元生成、BM25 / Dense 索引构建或复用、检索组件装配，以及完整规则证据输出。合作者需要在实验代码中完成题目读取、作答提示词、答案解析、准确率计算和结果保存。
 
-## 数据与文本契约
+## 1. 第一次运行
 
-| 模型 | 内容 |
-| --- | --- |
-| Rule | rule_id、完整原文 text、业务 metadata |
-| SearchUnit | unit_id、所属 rule_id、单元原文 text、必填 index_text、单元 metadata |
-| IndexedDataset | rules、units、已加载的索引资源，以及准备阶段的 tokenizer |
-| Candidate | 中间 Unit 命中、重排分数、来源及召回记录；没有索引文本或最终排名 |
-| RuleEvidence | 完整规则、最高重排分数、最终排名、来源、全部 matched_units 及 Rule metadata |
-| RetrievalResult | 原始 query、evidence: list[RuleEvidence]、运行统计 |
-
-完整 Rule 与 SubRule 可以放在同一个 Dataset。默认整条规则的 Unit ID 为 `rule:<rule_id>`；自定义策略可以使用 `sub_rule:<rule_id>:<position>`。在线不解析 ID 前缀，始终通过显式 rule_id 关联 Dataset.rules。
-
-- Unit.text 是单元原文，用于重排和命中记录。
-- Unit.index_text 用于 BM25 分词和文档 embedding，可以加入 Domain、Topic 或其他上下文。
-- RuleEvidence.text 从 Dataset 的完整 Rule 取得；即使索引只有 SubRule，也返回完整原文。
-- 作答模型接收最终完整规则文本，索引增强文本不进入结果。
-
-原始规则文件为非空 JSON 数组，每项包含字符串 rule_id 和 rule_text，支持可选的 metadata 对象。Domain、Topic 等业务信息放入 metadata，库不自动分类或生成这些内容。
-
-初赛检索语料是 `datasets/初赛规则集rules1.json` 中的 800 条规则；`datasets/初赛验证集dev.json` 提供查询与答案，不作为规则知识库。
-
-## 自动准备 Dataset
-
-Python 3.11+，使用 uv 管理依赖：
+需要 Python 3.11+ 和 uv，在项目根目录安装依赖：
 
 ```powershell
 uv sync --group dev
 ```
 
-```python
-from pathlib import Path
+将 [.env.example](.env.example) 复制为项目根目录的 `.env`，填写密钥；再到 [src/emergency_rag/settings.py](src/emergency_rag/settings.py) 的 `Settings` 中填写模型名与服务地址，无需在实验代码中手动加载：
 
-from emergency_rag.data.pipeline import DatasetPipeline
-from emergency_rag.unit_building.rule import RuleUnitBuilder
-from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
-
-dataset = DatasetPipeline(
-    embedding=embedding_client,
-    index_root=Path("data/indexes"),
-    unit_builder=RuleUnitBuilder(),
-    tokenizer=JiebaTokenizer(),
-).prepare(
-    Path("datasets/初赛规则集rules1.json"), dataset_name="preliminary",
-)
+```powershell
+Copy-Item .env.example .env
 ```
 
-DatasetPipeline 流程：
+`settings.py` 在首次导入时创建唯一的 `settings` 实例，统一读取配置；模型模块不各自加载文件。它从当前工作目录向上查找最近的 `.env`，从项目根目录或其子目录启动即可。配置优先级为：**进程环境变量 → `.env` → Settings 中的默认值**。查找位置不随 YAML 文件位置变化。
 
-1. 根据 dataset_name、unit_builder.name 和 tokenizer.name 确定目录。
-2. 目录存在时直接加载完整规则、单元和已有索引，跳过源文件读取、单元构建和文档 embedding。
-3. 目录不存在时读取 Rule、调用 UnitBuilder、合并 metadata、固定构建 BM25 与 Dense，并返回 IndexedDataset。
 
-UnitBuilder 接口是 `build(rules: list[Rule]) -> list[SearchUnit]`，负责单元划分和索引文本增强。默认 RuleUnitBuilder 一条规则生成一个 Unit，text 与 index_text 都等于原文。自定义实现可以只生成 SubRule，也可以同时生成完整 Rule 和 SubRule，不需要 Config 类或注册机制。
+| 模型用途                              | `.env` 中的密钥         | `Settings` 中的普通配置                                                                               |
+| ------------------------------------- | ----------------------- | ----------------------------------------------------------------------------------------------------- |
+| Embedding：离线文档向量、在线查询向量 | `RAG_EMBEDDING_API_KEY` | `embedding_model`、`embedding_base_url`、`embedding_timeout`、`embedding_max_retries`                 |
+| Qwen Reranker：Unit 重排              | `QWEN_RERANKER_API_KEY` | `qwen_reranker_model`、`qwen_reranker_base_url`、`qwen_reranker_timeout`、`qwen_reranker_max_retries` |
+| Chat：实验作答                        | `RAG_CHAT_API_KEY`      | `chat_model`、`chat_base_url`、`chat_timeout`、`chat_max_retries`                                     |
+| TypeSafe / Jev：单选题作答            | `TYPESAFE_API_KEY`      | `typesafe_model`、`typesafe_base_url`、`typesafe_timeout`、`typesafe_max_retries`                     |
 
-准备流程合并 Unit metadata 的顺序为：Rule metadata → Unit metadata 覆盖同名字段 → 写入构建来源。嵌套数据独立复制，不修改输入对象。例如：
+Embedding 默认 `qwen3-embedding-4b`，Qwen Reranker 默认 `qwen3-reranker-4b`，TypeSafe 默认 `jev-1.13.0`；Chat 模型名需要填写。未使用的模型可以保持未配置。超时默认 60 秒，最大重试默认 2 次。普通字段仍支持环境变量覆盖，例如 `RAG_EMBEDDING_MODEL`、`RAG_EMBEDDING_BASE_URL`、`RAG_CHAT_MODEL`、`QWEN_RERANKER_MODEL`、`QWEN_RERANKER_BASE_URL`。密钥只从环境读取，不写入源码，也不出现在 Settings 的 repr 中。
 
-```python
-{
-    "domain": "危险化学品",
-    "topic": "应急结束",
-    "position": 1,
-    "dataset": "preliminary",
-    "unit_builder": {"strategy": "rule-context"},
-}
-```
+云端重排未配置独立密钥与地址时，复用 `RAG_EMBEDDING_API_KEY` 和 `RAG_EMBEDDING_BASE_URL`；不同服务部署时可用 `QWEN_RERANKER_API_KEY`、`QWEN_RERANKER_BASE_URL` 单独覆盖。现有网关使用 `/v1/rerank`，通过 OpenAI SDK 的自定义请求入口调用，超时与重试仍由 SDK 处理。
 
-不同划分、增强或分词实验应使用不同 name；名称直接用于目录。相同名称下更换源数据或 embedding 模型时，通过 overwrite=True 显式重建。
+配置在 `settings` 实例创建时读取；SDK 客户端仍首次使用时才创建并缓存。修改配置后重启实验进程。未使用的模型不要求密钥，实际获取该模型时才检查模型名与密钥是否齐全。
 
-```text
-data/indexes/
-  preliminary-rule-jieba/
-    rules.json                  完整规则及业务 metadata
-    units.json                  text、index_text 和单元 metadata
-    index_meta.json             构建说明，在线不依赖
-    bm25/
-      ...                       BM25S 矩阵、参数及词表
-      unit_ids.json             索引行对应的 unit_id
-    dense/
-      faiss.index               离线归一化 IndexFlatIP
-      faiss_mapping.json        索引行对应的 unit_id
-      index_meta.json           Dense 构建说明
-  preliminary-rule-context-jieba/
-  semifinal-rule-jieba/
-```
-
-规则、单元和双路索引在同一次构建中写入临时目录，整体成功才替换目标目录；模型、写入或替换失败保留旧产物。数据格式、重复 ID、空白文本、Unit 到 Rule 的关联以及文档向量正确性由离线边界保证，检索器不重复校验。
-
-已有目录读取失败直接报错，不自动重建。旧产物缺少 rules.json 或 index_text 时，必须使用 overwrite=True 重建，无旧格式兼容层。构建说明只供查看，不进行语料指纹、模型地址或全库顺序审计。
-
-IndexedDataset 加载时读取并缓存已有索引、词表和映射。BM25 查询使用准备阶段携带的同一个 tokenizer，不接受独立 tokenizer 注入。在线只复用内存资源；Dense 仅计算查询 embedding，在线与离线应使用相同 embedding 模型。
-
-data 下保留 models、pipeline、indexing 三个模块。直接构建入口为 `build_dataset_indexes(units, index_root, rules=rules, tokenizer=tokenizer, embedding=embedding)`，必须提供完整规则快照。
-
-## 装配检索组件
-
-```python
-from emergency_rag.retrieval.fusion.rrf import RRFFusion
-from emergency_rag.retrieval.pipeline import RetrievalPipeline
-from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
-from emergency_rag.retrieval.retrievers.dense import DenseRetriever
-
-pipeline = RetrievalPipeline(
-    dataset=dataset,
-    retrievers=(
-        BM25Retriever(top_k=30),
-        DenseRetriever(embedding_client=embedding_client, top_k=30),
-    ),
-    fusion=RRFFusion(k=60, top_k=60),
-)
-result = pipeline.retrieve("危险化学品事故应急结束条件", top_k=10)
-for evidence in result.evidence:
-    print(evidence.final_rank, evidence.rule_id, evidence.final_score)
-    print(evidence.text)
-```
-
-Retriever 接口仍为 retrieve(query, dataset)，初始化决定召回预算，查询时不能覆盖。Pipeline 向所有检索器传同一个 Dataset；同一个 Retriever 可以在不同 Pipeline 中复用。
-
-默认 Reranker 原样返回 Unit 候选，便于无模型评分测试。需要完整评分时注入 ZeroEntropyReranker：
-
-```python
-from emergency_rag.retrieval.rerank.zero_entropy import ZeroEntropyReranker
-
-pipeline.reranker = ZeroEntropyReranker(
-    client=rerank_sdk,
-    model=rerank_model,
-    instruction="请评估规则片段与问题的相关性。",
-    batch_size=64,
-)
-```
-
-直接装配时，模型地址、密钥、超时和重试可以由调用方构造 SDK 时配置，例如 `EmbeddingClient(embedding_sdk, model=embedding_model, batch_size=64)`。YAML 加载使用模型模块提供的共享实例，读取 `.env.example` 中的进程环境变量；不自动读取 `.env`。
-
-## YAML 加载入口
+使用 [config/baseline.yaml](config/baseline.yaml) 加载检索流水线：
 
 ```python
 from emergency_rag.load_pipeline import load_pipeline
 
 pipeline = load_pipeline("config/baseline.yaml")
-result = pipeline.retrieve("危险化学品事故应急结束条件", top_k=10)
+result = pipeline.retrieve("危险化学品事故应急结束需要满足哪些条件？", top_k=10)
+
+for rule in result.evidence:
+    print(rule.final_rank, rule.rule_id, rule.final_score)
+    print(rule.text)
 ```
 
-[config/baseline.yaml](config/baseline.yaml) 提供完整的 BM25 + Dense + RRF + ZeroEntropy 声明。按 `.env.example` 设置 Embedding 和 Reranker 的模型地址、模型名、密钥、超时和重试；这些服务配置不进入 YAML。作答模型由 Chat 模块提供，检索加载不会创建 Chat 实例。
+第一次运行会构建索引，需要访问 Embedding 服务；后续复用已有目录。Baseline 使用本地 BCE 重排，无需重排 API 密钥，不产生云端重排请求；Dense 查询仍会请求 Embedding。只需无打分检索时，将 YAML 的 `reranker` 改为 `default` 或省略它。
 
-环境变量统一使用单下划线分隔：Embedding 为 `RAG_EMBEDDING_*`，Chat 为 `RAG_CHAT_*`。ZeroEntropy 使用专属的 `ZEROENTROPY_URL`、`ZEROENTROPY_API_KEY`、`ZEROENTROPY_MODEL`、`ZEROENTROPY_TIMEOUT` 和 `ZEROENTROPY_MAX_RETRIES`，不占用通用的 Rerank 配置名；其他重排实现可以使用自己的服务配置。
+**已有索引下的纯 BM25 检索不需要 Embedding 密钥。** 加载入口将 Embedding 客户端工厂延迟传给 DatasetPipeline，缓存命中时不调用它。启用 Dense 检索时需要查询 Embedding；首次构建或 `overwrite: true` 时仍固定构建 BM25、Dense 两路索引，因此需要文档 Embedding 配置。Chat 只在实验作答时创建，不是检索加载的依赖。
 
-加载函数返回 RetrievalPipeline，不返回配置包装对象。它先解析并构造全部需要的组件，再调用 DatasetPipeline.prepare，最后将 Dataset 注入 RetrievalPipeline。已有目录直接复用，缺失时自动构建，overwrite: true 时显式重建。加载一次后可遍历整个验证集，不要在每道题中重新加载。
+## 2. 如何配置 YAML
 
-YAML 分为 dataset 和 retrieval 两部分，只声明数据路径、组件名称和实验参数。无参数的组件直接写名称，有参数时写 name 和 params。以下配置使用默认无打分 Reranker：
+复制 Baseline 为一个实验配置文件，再调整数据与组件参数。例如：
 
 ```yaml
 dataset:
-  source: ../datasets/初赛规则集rules1.json
+  source: ../data/raw/初赛规则集rules1.json
   dataset_name: preliminary
   index_root: ../data/indexes
+  overwrite: false
   unit_builder: rule
   tokenizer: jieba
 
 retrieval:
   retrievers:
     - name: bm25
-      params: {top_k: 30}
+      params:
+        top_k: 30
     - name: dense
-      params: {top_k: 30}
-  fusion: union
+      params:
+        top_k: 30
+  fusion:
+    name: rrf
+    params:
+      k: 60
+      top_k: 60
+  reranker:
+    name: bce
+    params:
+      model_path: models/bce-reranker-base_v1
+      batch_size: 32
+  query_processor: default
+  expander: default
+  gate: default
 ```
 
-组件通过 registry.py 中的 COMPONENT_REGISTRY 显式登记，按阶段分组，使用实现类的 name 作为键。params 原样传入构造函数；省略 params 时使用组件默认参数。可选阶段省略时使用 Pipeline 默认实现，显式 null 不表示默认组件。
+YAML 顶层只有 `dataset` 和 `retrieval`。无参数的组件直接写注册名称，例如 `fusion: union`；有参数的组件写 `name` 和 `params`。`params` 是对应构造函数或注册工厂接受的关键字参数，不是任意配置字典。模型连接参数由 `settings.py` 管理，密钥放在环境变量中。
 
-注册名称包括 unit_builder 的 rule、tokenizer 的 jieba、retrievers 的 bm25/dense、fusion 的 rrf/union、reranker 的 default/zeroentropy；query_processor、expander 和 gate 的默认实现统一使用 default。
 
-自定义组件实现对应 ABC 后，在实验启动时登记一次。例如：
+| Dataset 字段   | 含义                                                 |
+| -------------- | ---------------------------------------------------- |
+| `source`       | 必填，规则 JSON 文件路径；不是验证题目文件           |
+| `dataset_name` | 必填，英文数据集名称，例如`preliminary`、`semifinal` |
+| `index_root`   | 索引根目录；省略时为 YAML 所在目录下的`data/indexes` |
+| `overwrite`    | 默认`false`；设为 `true` 时重新读取规则并重建产物    |
+| `unit_builder` | 默认`rule`；控制单元划分和索引文本增强               |
+| `tokenizer`    | 默认`jieba`；离线 BM25 与在线查询共用它              |
 
-```python
-from emergency_rag.registry import COMPONENT_REGISTRY
+`source` 和 `index_root` 的相对路径都以 **YAML 所在目录** 为起点，不以启动目录为起点。
 
-COMPONENT_REGISTRY["unit_builder"][MyUnitBuilder.name] = MyUnitBuilder
-COMPONENT_REGISTRY["fusion"][MyFusion.name] = MyFusion
-# YAML 随后可使用 MyUnitBuilder.name 和 MyFusion.name。
-```
 
-需要模型等额外依赖的自定义组件，可以登记一个显式注入依赖的工厂函数。内置 Dense 和 ZeroEntropy 也是这样登记的；加载器不按算法名做分支。
+| Retrieval 阶段            | 内置名称                 | 常用参数 / 默认行为                     |
+| ------------------------- | ------------------------ | --------------------------------------- |
+| `retrievers`，必填列表    | `bm25`、`dense`          | 各自`top_k=30`，表示召回 Unit 数        |
+| `fusion`，必填            | `rrf`、`union`           | RRF：`k=60`、`top_k=60`；Union：无参数  |
+| `query_processor`，可省略 | `default`                | 原查询直接用于检索                      |
+| `expander`，可省略        | `default`                | 原样返回 Unit 候选                      |
+| `reranker`，可省略        | `default`、`bce`、`qwen` | 默认不打分；BCE 本地推理，Qwen 云端评分 |
+| `gate`，可省略            | `default`                | 放行所有聚合后的规则证据                |
 
-source 和 index_root 相对 YAML 所在目录解析，省略 index_root 时默认为该目录下的 data/indexes，与启动目录无关。最终 top_k 仍在 retrieve 调用时指定，表示规则数量，不进入 Pipeline 构造参数。
+可选阶段省略时使用默认组件；不要写 `null`。最终返回数量由 `pipeline.retrieve(query, top_k=10)` 控制，不写入 YAML 的 Pipeline 构造参数。
 
-共享模型入口位于各自模块：
+BCE 参数为 `model_path`、`device`、`use_fp16`、`batch_size=32`。本地权重默认位于 `models/bce-reranker-base_v1`，相对模型路径以进程工作目录为起点，从项目根目录启动即可。首次选择 BCE 时才加载本地模型并缓存，后续题目复用；不自动下载权重。`device` 省略时自动选择 CUDA 或 CPU，CPU 使用 FP32，CUDA 默认使用 FP16。BCE 不接受 instruction；重排调用 SDK 的 `rerank()` 执行长文本滑窗评分，保留全部候选和完整精度分数，不在重排阶段过滤或截取 Top-K。SDK 的 `compute_score()` 会截断长文本，不能替代此路径。
 
-```python
-from emergency_rag.clients.embedding import get_embedding_client
-from emergency_rag.clients.chat import get_chat_client
-from emergency_rag.retrieval.rerank.zero_entropy import get_rerank_model
-```
+注册名 `qwen` 用于云端 Qwen 对照，接受 `instruction`、`batch_size=64`。Qwen 的 `instruction` 会以 `<Instruct>: ...\n<Query>: ...` 拼入发送给重排服务的查询，文档仍使用 Unit 原始 `text`。这是查询上下文增强：当前网关的独立 `instruction` / `instruct` 字段未表现出被使用，不能将此方式视为模型原生自定义 prompt。Qwen 模型原生指令格式见[官方模型卡](https://huggingface.co/Qwen/Qwen3-Reranker-4B)。修改重排指令不改变召回查询，也不需要重建索引。
 
-模型在首次使用时创建并缓存，不在模块导入时创建。设置环境变量后，Dataset 离线构建和各 DenseRetriever 共享同一个 EmbeddingClient；不同 load_pipeline 调用也复用它。ZeroEntropy 通过 get_rerank_model(instruction=..., batch_size=...) 获取重排器，相同参数复用同一实例，不同参数分别缓存。ChatClient 仅在作答用例调用时创建，初始化时确定模型名；get_chat_client() 从 RAG_CHAT_MODEL 读取它。
+三个预算分别生效：Retriever 的 `top_k` 限制原始召回 Unit 数；RRF 的 `top_k` 限制融合后 Unit 数；查询入口的 `top_k` 限制最终不同规则数。Union 交替合并各路已有结果并按 Unit 去重，没有额外预算。两路各召回 30 个 Unit，重叠 12 个时，Union 输出 48 个。重排 `batch_size` 只拆分请求，不截断候选。
 
-环境变量在模型首次创建时读取；同一进程之后修改环境不会自动替换实例。无模型配置时仍可以导入组件或直接装配 mock 模型，实际请求共享模型时才报缺少配置。SDK 超时和重试默认 60 秒与 2 次，可用对应环境变量覆盖。
+### 查询缓存是固定行为
 
-配置使用 safe_load 解析。非法 YAML、未知注册名称、错误参数和不符合阶段 ABC 的组件明确报 PipelineConfigError。Dataset 构建、文件读取和模型调用失败保持原有异常，不静默降级或重建。
-
-## 规则聚合与独立预算
+通过 `load_pipeline()` 加载时，QueryProcessor 的处理结果和 Dense 查询向量都会自动持久化，不需要在 YAML 中增加缓存字段。默认目录由 `Settings.query_cache_root` 决定，初始值为相对进程工作目录的 `data/cache`：
 
 ```text
-QueryProcessor
-→ 各 Retriever.retrieve(query, pipeline.dataset)
-→ Fusion（按 unit_id 合并）
-→ Expansion
-→ Reranker（完整评分 Unit.text）
-→ 按 rule_id 聚合 RuleEvidence
-→ EvidenceGate
-→ Top-K 条规则
-→ 连续 final_rank 与 RetrievalResult
+data/cache/
+  query_processing/default/queries.json
+  query_embeddings/qwen3-embedding-4b/embeddings.json
 ```
 
-Fusion 保留同一 Rule 的不同 Unit，避免提前丢失重排机会。RRF 使用自己的融合总预算；Union 交替合并各检索器全部有序结果，不再排序或截断。两路各 30 个 Unit、重叠 12 个 Unit 时，Union 输出 48 个 Unit。
+查询处理以原始问题作键，保存完整 `QueryContext`，包括改写问题和子查询；查询向量以实际参与检索的文本作键，记录完整模型名和实际维度。相同子查询即使来自不同题目，也可以复用向量。改变 BM25、Fusion、Reranker、Gate 或最终 Top-K 不需要重算这些内容。离线文档 Embedding 继续使用 `embed_batch()`，不混用查询缓存。
 
-| 组件 | 参数及默认值 | 预算含义 |
-| --- | --- | --- |
-| BM25Retriever | top_k=30 | BM25 召回 Unit 数 |
-| DenseRetriever | top_k=30 | Dense 召回 Unit 数 |
-| RRFFusion | k=60；top_k=60 | RRF 常数及融合 Unit 总上限 |
-| UnionFusion | 无配置 | 合并所有已召回 Unit |
-| ZeroEntropyReranker | model；instruction；batch_size=64 | 批大小只拆分请求，不限制总候选数 |
-| RetrievalPipeline.retrieve | top_k=10 | Gate 后最多返回的不同 Rule 数 |
+文件首次使用时读取到内存，后续查找不反复读盘；成功结果立即保存，重新启动实验也能复用。Dense 命中缓存时不发起 Embedding 请求，但加载 Dense 仍需要有效的模型客户端配置。失败请求、非法向量或写入失败不会替换旧缓存；文件完整写入后原子替换。缓存目录已加入 Git 忽略，没有 hash、语料指纹或数据库。
 
-按 rule_id 分组后，规则分数取本次命中 Unit 的最高重排分数，按分数降序；平分时按 rule_id 排序。只使用实际命中，不补查兄弟单元，不重新重排完整规则。例如三个规则 37 的单元分数为 0.95、0.90、0.88，规则 463 的单元分数为 0.85，Top-2 返回完整规则 37 和 463，分数分别为 0.95、0.85。
+**查询处理的缓存目录按组件 `name` 隔离。** 自定义改写组件应让 `name` 表达模型和策略版本，例如 `rewrite-qwen3-v2`；更换 Rewrite 模型、提示词或拆分规则时换用新名称。加载器通过接口名称判断缓存身份，不窥探具体组件内部字段。Embedding 模型名变化自动使用不同子目录；相同模型名下权重或查询向量生成方式改变时，修改 `settings.query_cache_root` 为新版本目录。新策略生成的查询文本与旧文本相同且共用查询向量目录时，仍能复用向量。
 
-无打分模式保持规则首次出现顺序，final_score=None，不把召回或融合得分当作相关性分数。EvidenceGate 接收聚合后的完整规则，默认原样返回；自定义 Gate 按规则分数、排名或业务信息筛选。Top-K 截断后写入连续排名。
+需要显式更新某个问题时，直接刷新对应缓存：
 
-matched_units 保留全部命中片段及分数、来源和 metadata。规则 metadata 来自完整 Rule，片段位置等信息留在 matched_units 内。结果只提供 evidence，没有 candidates 兼容别名，不再提供证据投影阶段。
+```python
+pipeline = load_pipeline("config/baseline.yaml")
+pipeline.query_processor.process("原始问题", refresh=True)
 
-QueryContext 保存 original_query、rewritten_query 和 sub_queries。queries 属性组合主查询与子查询，Pipeline 逐个召回；重排和 result.query 使用 original_query。运行 metadata 保存总耗时、各路召回数、融合 Unit 数、聚合规则数、最终规则数及组件名称。
+from emergency_rag.clients.embedding import get_embedding_client
+get_embedding_client().embed_query("实际检索文本", refresh=True)
+```
 
-## 一次实验与模型作答
+平时继续调用 `pipeline.retrieve(query)` 即可。缓存刷新成功后后续查询复用新结果；刷新失败保留旧结果。当前文件缓存适用于单写入进程和后续跨进程复用；并行写入的实验应使用不同的 `query_cache_root`。缓存损坏明确报错，不静默调用付费模型重算。
 
-[examples/preliminary_experiment.py](examples/preliminary_experiment.py) 是唯一实验示例。Dataset 和检索组件通过 YAML 加载一次；实验函数负责提示词与模型作答，返回检索结果和原始答案：
+## 3. 加载器会自动完成什么
+
+`load_pipeline(path)` 返回一个 `RetrievalPipeline`，可以复用于整个验证集：
+
+1. 读取 YAML，按阶段注册表构造组件，检查名称、参数和 ABC 类型。
+2. 注入模型依赖：DatasetPipeline 接收延迟创建 Embedding 的工厂，仅实际构建时调用；启用 Dense 时使用同一共享客户端。BCE 或 Qwen 从各自模块的 `get_rerank_model()` 获取缓存的重排器，未选择 BCE 时不加载 Torch 或本地权重。
+3. 运行 DatasetPipeline，准备或加载完整 Rule、SearchUnit 和索引。
+4. 将同一个 Dataset 注入 RetrievalPipeline，返回可调用的检索对象。
+
+Dataset 目录固定为：
+
+```text
+<index_root>/<dataset_name>-<unit_builder.name>-<tokenizer.name>-<embedding_model>/
+  rules.json              完整规则快照及 metadata
+  units.json              检索单元的 text、index_text 及 metadata
+  index_meta.json         构建说明
+  bm25/                   BM25 索引、词表和 Unit 行映射
+  dense/                  FAISS 索引、Unit 行映射和构建说明
+```
+
+默认目录名为 `preliminary-rule-jieba-qwen3-embedding-4b`。切换 Embedding 模型后自动选择不同目录；模型名中的斜杠、空格等目录不适用字符转为 `-`，构建说明中的 `embedding_model` 仍保存完整模型名。目录存在且 `overwrite: false` 时，直接加载产物，不读取源规则、不调用 UnitBuilder、不请求文档 Embedding，也不创建 Embedding 客户端。不存在时，读取规则、生成 Unit、合并 metadata，并构建两路索引。重建全部成功才替换目标目录；失败保留旧产物。已有产物读取失败会报错，不自动重建。
+
+直接装配 DatasetPipeline 时，传入 EmbeddingClient 会自动使用它的 `model`；传入延迟客户端工厂时，同时传入 `embedding_model`。`load_pipeline()` 自动从 Settings 注入模型名，无需在 YAML 重复配置。实际构建继续在 `index_meta.json` 记录模型名和向量维度。
+
+**目录是否存在决定缓存是否复用，不会自动识别配置变化。** 更换源数据、Embedding 模型、单元增强参数或分词参数时，使用新的数据集 / 策略名称，或设置 `overwrite: true` 显式重建。完成重建后将其恢复为 `false`。离线文档向量与在线查询必须使用相同 Embedding 模型；分词器必须保持相同策略。
+
+配置错误抛出 `PipelineConfigError`；文件、索引构建和模型调用错误向调用方传播。实验代码负责记录失败，不要把失败当作空答案或静默切换算法。
+
+## 4. 检索结果与数据约定
+
+```text
+规则文件 → UnitBuilder → index_text 构建双路索引 → IndexedDataset
+
+查询 → QueryProcessor → Retrievers → Fusion → Expansion → Reranker
+     → 按 rule_id 聚合完整规则 → EvidenceGate → Top-K 条规则
+```
+
+原始规则文件是非空 JSON 数组，`rule_id` 是唯一非空字符串，`rule_text` 是非空原文，`metadata` 可省略：
+
+```json
+[
+  {
+    "rule_id": "37",
+    "rule_text": "这里是完整规则原文。",
+    "metadata": {"domain": "危险化学品", "topic": "应急结束"}
+  }
+]
+```
+
+初赛规则文件为 `data/raw/初赛规则集rules1.json`，含 800 条规则；`data/raw/初赛验证集dev.json` 是实验题目与答案，不作为索引语料。
+
+
+| 对象              | 使用约定                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------ |
+| `Rule`            | `rule_id`、完整原文 `text`、业务 `metadata`                                          |
+| `SearchUnit`      | 唯一`unit_id`、关联 `rule_id`、单元原文 `text`、索引文本 `index_text`、`metadata`    |
+| `IndexedDataset`  | 完整`rules`、`units`、已加载索引及同一个 tokenizer                                   |
+| `Candidate`       | Unit 层命中；保存单元原文、来源、召回记录及重排分数                                  |
+| `RuleEvidence`    | 最终完整规则；保存`final_score`、`final_rank`、来源、`matched_units` 及规则 metadata |
+| `RetrievalResult` | 原始`query`、最终 `evidence`、耗时与候选数量等 `metadata`                            |
+
+`index_text` 可以加入 Domain、Topic 或上下文；它只用于 BM25 索引和文档 Embedding。`text` 保留单元原文，供重排和命中分析。最终证据文本始终取自 `dataset.rules[rule_id].text`，不是增强文本，也不是子规则片段。
+
+完整 Rule 与多个 SubRule 可以共存。默认 Unit ID 为 `rule:<rule_id>`；自定义 ID 格式不影响检索，关联规则只使用显式 `rule_id`。DatasetPipeline 合并 metadata 的顺序是：Rule metadata → Unit metadata 覆盖同名字段 → 写入 `dataset` 和 `unit_builder` 构建信息。
+
+重排后按规则聚合，分数取该规则本次命中 Unit 的最高重排分数，不累加；同分按 `rule_id` 排序。默认无打分模式下 `final_score=None`，保留规则首次出现顺序。Gate 收到完整规则证据，最终 Top-K 按不同规则计数，排名从 1 开始。`matched_units` 保留全部命中单元及召回记录。
+
+## 5. 如何实现和使用新组件
+
+继承对应阶段的 ABC，提供稳定的英文 `name`，实现下表接口。简单参数直接写构造函数；只有确实复杂的初始化才需要组件自己的 Config 类。
+
+
+| 扩展点与接口模块                                   | 方法                                                                 | 需要保持的语义                                                |
+| -------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `units/base.py`：`UnitBuilder`                     | `build(rules: list[Rule]) -> list[SearchUnit]`                       | 每个 Unit 关联已有 Rule；可切分子规则或增强索引文本           |
+| `retrieval/tokenizer/base.py`：`TextTokenizer`     | `tokenize(text: str) -> list[str]`                                   | 索引与查询共用同一策略                                        |
+| `retrieval/query/base.py`：`QueryProcessor`        | `process(query: str) -> QueryContext`                                | 保留`original_query`；可设置 `rewritten_query`、`sub_queries` |
+| `retrieval/retrievers/base.py`：`Retriever`        | `retrieve(query: str, dataset: IndexedDataset) -> list[Candidate]`   | 返回有序 Unit 候选，预算在初始化时确定                        |
+| `retrieval/fusion/base.py`：`Fusion`               | `fuse(result_sets: list[list[Candidate]]) -> list[Candidate]`        | 按 Unit 合并，保留来源和召回记录                              |
+| `retrieval/expansion/base.py`：`CandidateExpander` | `expand(candidates: list[Candidate]) -> list[Candidate]`             | 输入输出仍是 Unit 候选                                        |
+| `retrieval/rerank/base.py`：`Reranker`             | `rerank(query: str, candidates: list[Candidate]) -> list[Candidate]` | 评分模式完整打分排序；默认模式原样返回                        |
+| `retrieval/gate/base.py`：`EvidenceGate`           | `filter(evidence: list[RuleEvidence]) -> list[RuleEvidence]`         | 在规则聚合后筛选，不处理 Unit 候选                            |
+
+查询处理返回的 `QueryContext.queries` 为改写后的主查询（未改写时为原查询）加子查询。Pipeline 对每个查询调用所有 Retriever；重排与最终结果仍使用 `original_query`。
+
+例如，将规则主题加入索引文本，同时保留原文：
+
+```python
+from emergency_rag.data.models import Rule, SearchUnit
+from emergency_rag.registry import COMPONENT_REGISTRY
+from emergency_rag.units.base import UnitBuilder
+from emergency_rag.load_pipeline import load_pipeline
+
+
+class TopicUnitBuilder(UnitBuilder):
+    name = "rule-topic"
+
+    def build(self, rules: list[Rule]) -> list[SearchUnit]:
+        return [
+            SearchUnit(
+                unit_id=f"rule:{rule.rule_id}",
+                rule_id=rule.rule_id,
+                text=rule.text,
+                index_text=f"{rule.metadata.get('topic', '')}\n{rule.text}",
+            )
+            for rule in rules
+        ]
+
+
+# 在加载配置之前登记一次，YAML 才能识别该名称。
+COMPONENT_REGISTRY["unit_builder"][TopicUnitBuilder.name] = TopicUnitBuilder
+pipeline = load_pipeline("config/topic_experiment.yaml")
+```
+
+在复制的 YAML 中将 `dataset.unit_builder` 改为 `rule-topic`，其余配置可以保持不变。索引将写入 `preliminary-rule-topic-jieba`。不同切分、增强或分词策略应使用不同名称，避免误复用缓存。
+
+注册表位于 [src/emergency_rag/registry.py](src/emergency_rag/registry.py)，按阶段保存名称到构造函数的映射。新 Fusion 例如登记到 `COMPONENT_REGISTRY["fusion"][MyFusion.name]`，新 Gate 登记到 `COMPONENT_REGISTRY["gate"][MyGate.name]`。名称只需在所属阶段内唯一。
+
+组件需要模型等依赖时，登记一个显式注入依赖的工厂；工厂的参数对应 YAML 的 `params`：
+
+```python
+def build_my_reranker(*, instruction: str, batch_size: int = 64):
+    return MyReranker(
+        client=get_my_model_client(),
+        instruction=instruction,
+        batch_size=batch_size,
+    )
+
+
+COMPONENT_REGISTRY["reranker"][MyReranker.name] = build_my_reranker
+```
+
+`MyReranker` 和 `get_my_model_client` 由实验实现提供。无需给加载器增加算法分支。新组件也可以直接用 Python 装配，不必注册：
+
+```python
+from emergency_rag.retrieval.pipeline import RetrievalPipeline
+from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
+from emergency_rag.retrieval.fusion.union import UnionFusion
+
+pipeline = RetrievalPipeline(
+    dataset=dataset,
+    retrievers=(BM25Retriever(top_k=30),),
+    fusion=UnionFusion(),
+    gate=MyGate(),
+)
+```
+
+这里的 `dataset` 是已准备的 IndexedDataset，`MyGate` 是继承 EvidenceGate 的实现。需要自行准备 Dataset 时使用 `DatasetPipeline(...).prepare(source, dataset_name=...)`，接口见 [src/emergency_rag/data/pipeline.py](src/emergency_rag/data/pipeline.py)。
+
+## 6. 从检索到完整实验，还需要什么
+
+[examples/chat_experiment.py](examples/chat_experiment.py) 提供单道题的检索与作答函数。它只将最终完整规则作为上下文，返回检索结果和模型原始答案：
+
+示例入口使用 [config/baseline.yaml](config/baseline.yaml)，采用本地 BCE 重排；准备本地权重并配置 Embedding 和 Chat 即可。[config/example.yaml](config/example.yaml) 使用bce重排器。可从项目根目录直接运行。输出包含问题、完整规则证据及排名、检索统计和模型原始答案；连接地址、密钥和模型名不写在示例中。
+
+```powershell
+uv run python examples/chat_experiment.py
+```
 
 ```python
 from emergency_rag.clients.chat import get_chat_client
 from emergency_rag.load_pipeline import load_pipeline
-from examples.preliminary_experiment import run_experiment
+from examples.chat_experiment import run_experiment
 
 pipeline = load_pipeline("config/baseline.yaml")
+chat = get_chat_client()
+
 result, answer = run_experiment(
     pipeline=pipeline,
-    chat=get_chat_client(),
+    chat=chat,
     question="危险化学品事故应急结束需要满足哪些条件？",
     instructions="请根据参考规则回答问题，并注明规则编号。",
     top_k=10,
 )
 ```
 
-作答上下文只使用 result.evidence 中完整规则原文与规则 ID。选择题将选项放入 question，并在 instructions 中要求返回选项；问答题可以要求文字说明。遍历验证集时复用 pipeline；Response 解析、标准答案比较和准确率计算由实验用例实现，不进入加载器或检索组件。
+`pipeline` 和 `chat` 在题目循环之外创建一次。问答题通过指令要求文字说明；选择题将选项放入 `question`，通过指令约定选项输出格式。
 
-ChatClient 只发送调用方 messages 并检查非空文本，不注入业务提示词、不强制 JSON、不解析业务响应。max_tokens、response_format 仅在显式传入时发送；SDK 错误原样抛出，超时与重试由 SDK 配置。
 
-## 验证与真实模型验收
+| 实验代码需要补齐   | 建议输出 / 行为                                                         |
+| ------------------ | ----------------------------------------------------------------------- |
+| 读取验证集         | 题目 ID、题干、选项、标准答案；按验证文件真实格式适配                   |
+| 业务提示词         | 明确任务、证据使用方式和回答格式                                        |
+| Response 解析      | 将原始文本转为可比较答案；明确非法输出如何处理                          |
+| 准确率计算         | 按题型定义答案归一化和判定方式，记录分子、分母                          |
+| 批量运行与异常记录 | 复用 Pipeline / Chat，记录请求失败和解析失败，明确是否计入分母          |
+| 实验结果保存       | 配置、题目 ID、检索规则及分数、原始回答、解析答案、标准答案、判定与耗时 |
+
+`ChatClient` 初始化时确定模型名，`complete(messages=..., max_tokens=..., response_format=...)` 返回非空文本。`get_chat_client()` 使用共享 `settings`；直接注入 SDK 时使用 `ChatClient(sdk, model="模型名")`。提示词、JSON 解析、请求节流和答案判定都属于实验代码。需要结构化输出时由调用方显式传 `response_format`，客户端不会默认要求 JSON。
+
+### 使用 TypeSafe / Jev 回答单选题
+
+[ChoiceQAClient](src/emergency_rag/clients/choice_qa_client.py) 使用官方同步 `typesafe-sdk`，通过 `Choice` 请求返回类型化 `ChoiceAnswer`，包含选项标签、置信度和各选项概率，接口依据 [TypeSafe 官方文档](https://docs.typesafe.ai/introduction/quickstart)。它是作答客户端，由实验调用，不属于检索组件注册表。
+
+在 `.env` 填写 `TYPESAFE_API_KEY`，模型和地址可以直接修改 Settings 的默认值，也可通过以下环境变量覆盖：
+
+```dotenv
+TYPESAFE_MODEL=jev-1.13.0
+TYPESAFE_BASE_URL=your-bse-url
+```
+
+`typesafe_base_url` / `TYPESAFE_BASE_URL` 填 API 根地址。SDK 自行追加 `/v1/systemone`，此网关不要填写末尾的 `/v1`。超时与重试可用 `TYPESAFE_TIMEOUT`、`TYPESAFE_MAX_RETRIES` 覆盖，重试由 SDK 负责。
+
+```python
+from emergency_rag.clients.choice_qa_client import get_choice_qa_client
+from emergency_rag.load_pipeline import load_pipeline
+
+pipeline = load_pipeline("config/baseline.yaml")
+choice_client = get_choice_qa_client()
+result = pipeline.retrieve("事故现场应急处置工作结束需要谁确认和批准？", top_k=10)
+
+answer = choice_client.choose(
+    state={
+        "question": "事故现场应急处置工作结束需要谁确认和批准？",
+        "evidence": [
+            {"rule_id": rule.rule_id, "text": rule.text}
+            for rule in result.evidence
+        ],
+    },
+    instructions="仅根据参考规则选择唯一正确选项。",
+    choices={"A": "现场应急救援指挥部", "B": "任意救援队员"},
+)
+print(answer.choice, answer.confidence, answer.probabilities)
+```
+
+`state` 可以是文本或 JSON 对象 / 数组；题干、完整规则证据和指令由实验提供。`choices` 的键是答案标签，值是选项内容。该接口每次选择一个标签，不直接处理多选答案集合。客户端校验响应类型、选项对应关系和概率范围；请求失败原样抛出 SDK 异常。准确率判定由实验将 `answer.choice` 与标准答案比较，置信度不是准确率。
+
+[examples/choice_qa_experiment.py](examples/choice_qa_experiment.py) 提供完整单题示例。准备 Baseline 所需的本地 BCE 权重，配置 Embedding 和 TypeSafe 密钥后，从项目根目录运行：
+
+```powershell
+uv run python examples/choice_qa_experiment.py
+```
+
+输出包含检索规则 ID、选项、置信度、概率分布和本题判定。批量实验可导入 `run_choice_experiment()`，传入已加载的 Pipeline、ChoiceQAClient、题干、选项和指令；返回 `(RetrievalResult, ChoiceAnswer)`。Pipeline 与客户端在题目循环外创建一次，逐题保存结果并累计准确率。也可传入使用默认无打分重排器的自定义 Pipeline，无需 Qwen Reranker 配置。
+
+## 7. AI 辅助开发必须遵守的边界
+
+给 AI 分配新策略或实验时，先说明要扩展哪个接口、输入输出是什么、如何验证。请将以下约束一并提供给 AI：
+
+- **保持组件可直接构造。** 组件不读取 YAML，也不依赖加载器或顶层实验配置；外部模型通过构造参数注入。YAML 的解析与装配留在 `load_pipeline` 和注册表。
+- **统一模型配置入口。** 新增服务的连接参数与环境读取放在 `settings.py`，模型获取函数读取共享 `settings`。不要在组件中复制 `.env` 查找、读取环境变量或实例化另一份 Settings；密钥不得写入源码。
+- **保持单 Dataset 检索。** Dataset 在 Pipeline 注入一次，Retriever 接口保持 `retrieve(query, dataset)`。不要让每个 Retriever 重新读取源文件、构建索引或管理数据目录。
+- **保持文本用途。** 索引使用 `index_text`，重排使用 Unit `text`，作答使用完整 Rule `text`。不得用增强文本替换规则原文。
+- **保持 Unit 与 Rule 的关联。** 每个 Unit ID 唯一，`rule_id` 指向已保存的完整 Rule；不要通过 ID 前缀推断关联。Fusion 不提前按 Rule 去重。
+- **保持分数语义。** `Candidate.final_score` 只表示重排分数，评分重排器为全部输入候选打分，分数必须是 `[0, 1]` 内有限数值。召回记录写入 `metadata["retrieval"]`，融合信息写入 `metadata["fusion"]`，来源写入 `sources`；排名从 1 开始。
+- **保持预算独立。** Retriever 预算只在初始化配置；Union 不额外截断；重排批大小不充当候选上限；最终 Top-K 在规则聚合、Gate 之后执行。
+- **保持缓存规则明确。** 策略变更使用新名称或显式重建，不添加自动重建、hash / 指纹审计或模型地址比对。不要在每层重复校验已由离线构建保证的数据事实。
+- **保持职责集中。** Pipeline 只编排阶段和聚合规则；作答提示词、Response 解析、评测和实验文件输出留在用例中。不要增加插件自动发现、通用 Manager / Service、空 Config 或额外 Projector 阶段。
+- **保持失败可见。** 不静默降级，不把 API、索引或解析失败伪装成正常结果；超时和重试由模型客户端边界配置。
+- **验证真实接口。** 新策略用对应 ABC 和共享模型，补充行为测试；远程调用使用 mock，BM25 / FAISS 持久化使用实际实现。不得将 mock 测试通过表述为真实模型或答案准确率验收通过。
+
+运行测试：
 
 ```powershell
 uv run pytest -q
 ```
 
-测试默认禁止真实网络，使用实际 BM25S、FAISS 和 SDK HTTP MockTransport。覆盖默认 800 条规则、规则与子规则、增强文本索引、原文重排、规则最高分聚合、规则级 Gate 和 Top-K、缓存和重建，以及 YAML 注册装配、共享模型、环境配置、相对路径、自定义注册组件、实验指令隔离和配置错误。
-
-正式双路产物由真实实验首次生成。按 `.env.example` 配置实际模型服务后可以使用共享入口，也可以继续直接装配 SDK。pytest 的 mock 响应验证代码与调用契约，不替代真实模型链路验收。
+测试默认禁止真实网络。涉及新索引策略时，至少验证保存加载、增强文本与原文分离、Rule / SubRule 聚合和缓存重建；涉及新检索或重排策略时，验证预算、来源记录、排序和候选集合。真实模型链路与完整实验准确率需要配置服务后另行运行，并保存实际结果。
