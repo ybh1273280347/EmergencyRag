@@ -297,11 +297,17 @@ pipeline = RetrievalPipeline(
 
 这里的 `dataset` 是已准备的 IndexedDataset，`MyGate` 是继承 EvidenceGate 的实现。需要自行准备 Dataset 时使用 `DatasetPipeline(...).prepare(source, dataset_name=...)`，接口见 [src/emergency_rag/data/pipeline.py](src/emergency_rag/data/pipeline.py)。
 
-## 6. 从检索到完整实验，还需要什么
+## 6. 运行检索示例与完整实验
 
-[examples/chat_experiment.py](examples/chat_experiment.py) 提供单道题的检索与作答函数。它只将最终完整规则作为上下文，返回检索结果和模型原始答案：
+仓库提供三个单题入口，均从项目根目录运行。它们使用仓库规则集和对应的默认 YAML 配置；第一次运行会建立 BM25 与 Dense 两路索引，因此需要 Embedding 服务。三个示例入口当前都启用本地 BCE 重排，还需要 `models/bce-reranker-base_v1` 权重；BCE 不会自动下载模型。输出为单题演示，不会读取验证集或计算完整数据集准确率。
 
-示例入口使用 [config/baseline.yaml](config/baseline.yaml)，采用本地 BCE 重排；准备本地权重并配置 Embedding 和 Chat 即可。[config/example.yaml](config/example.yaml) 使用bce重排器。可从项目根目录直接运行。输出包含问题、完整规则证据及排名、检索统计和模型原始答案；连接地址、密钥和模型名不写在示例中。
+只运行检索可使用 [examples/retrieve_experiment.py](examples/retrieve_experiment.py)：它加载 [config/example.yaml](config/example.yaml)，用 BM25 召回、RRF 融合和 BCE 重排，并连续运行同一问题两次展示冷启动与预热查询。需要 Embedding 配置和本地 BCE 权重，不需要 Chat 或 TypeSafe 密钥：
+
+```powershell
+uv run python examples/retrieve_experiment.py
+```
+
+检索并调用 Chat 作答可运行 [examples/chat_experiment.py](examples/chat_experiment.py)。它加载 [config/baseline.yaml](config/baseline.yaml)，需要本地 BCE 权重、Embedding 配置，以及 `RAG_CHAT_API_KEY` 和 `RAG_CHAT_MODEL`：
 
 ```powershell
 uv run python examples/chat_experiment.py
@@ -375,7 +381,7 @@ print(answer.choice, answer.confidence, answer.probabilities)
 
 `state` 可以是文本或 JSON 对象 / 数组；题干、完整规则证据和指令由实验提供。`choices` 的键是答案标签，值是选项内容。该接口每次选择一个标签，不直接处理多选答案集合。客户端校验响应类型、选项对应关系和概率范围；请求失败原样抛出 SDK 异常。准确率判定由实验将 `answer.choice` 与标准答案比较，置信度不是准确率。
 
-[examples/choice_qa_experiment.py](examples/choice_qa_experiment.py) 提供完整单题示例。准备 Baseline 所需的本地 BCE 权重，配置 Embedding 和 TypeSafe 密钥后，从项目根目录运行：
+[examples/choice_qa_experiment.py](examples/choice_qa_experiment.py) 提供完整单题示例，加载同一 Baseline 检索配置。准备本地 BCE 权重，配置 Embedding 和 TypeSafe 密钥后，从项目根目录运行：
 
 ```powershell
 uv run python examples/choice_qa_experiment.py
