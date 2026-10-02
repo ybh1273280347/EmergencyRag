@@ -14,7 +14,7 @@ from emergency_rag.retrieval.rerank.base import Reranker
 from emergency_rag.retrieval.retrievers.bm25 import BM25Retriever
 from emergency_rag.retrieval.retrievers.dense import DenseRetriever
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
-from emergency_rag.data.units import RuleUnitBuilder
+from emergency_rag.data.units.rule import RuleUnitBuilder
 
 
 def _dense_retriever(**params: Any) -> DenseRetriever:

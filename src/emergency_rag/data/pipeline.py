@@ -6,8 +6,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from emergency_rag.data.units import UnitBuilder
-from emergency_rag.data.units import RuleUnitBuilder
+from emergency_rag.data.units.base import UnitBuilder
+from emergency_rag.data.units.rule import RuleUnitBuilder
 from emergency_rag.clients.embedding import EmbeddingClient
 from emergency_rag.retrieval.tokenizer.base import TextTokenizer
 from emergency_rag.retrieval.tokenizer.jieba import JiebaTokenizer
