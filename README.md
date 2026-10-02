@@ -4,6 +4,46 @@
 
 项目自动完成规则读取、检索单元生成、BM25 / Dense 索引构建或复用、检索组件装配，以及完整规则证据输出。合作者需要在实验代码中完成题目读取、作答提示词、答案解析、准确率计算和结果保存。
 
+## 项目目录与核心入口
+
+```text
+.
+├── config/                 YAML 实验配置
+├── data/
+│   ├── raw/                 原始规则语料与验证题目
+│   ├── indexes/             自动生成并复用的 BM25 / Dense 索引
+│   └── cache/               查询处理结果与查询向量缓存
+├── examples/                单题检索、Chat 作答、TypeSafe 单选示例
+├── models/                  本地模型权重（如 BCE Reranker）
+├── src/emergency_rag/
+│   ├── load_pipeline.py      YAML 加载入口，构造组件、准备数据并返回检索流水线
+│   ├── settings.py           统一模型参数和密钥配置
+│   ├── registry.py           YAML 可用的组件名称及构造工厂
+│   ├── clients/              Embedding、Chat、TypeSafe 客户端
+│   ├── data/                 规则读取、检索单元构建、索引构建与加载
+│   └── retrieval/            查询处理、召回、融合、重排、规则聚合与过滤
+├── tests/                    单元与集成测试
+├── .env.example              环境变量模板
+└── pyproject.toml            项目依赖、构建与 pytest 配置
+```
+
+常用入口与职责：
+
+| 文件 | 作用 |
+| --- | --- |
+| [config/baseline.yaml](config/baseline.yaml) | 默认实验配置：BM25 + Dense 召回、RRF 融合、本地 BCE 重排。 |
+| [src/emergency_rag/load_pipeline.py](src/emergency_rag/load_pipeline.py) | `load_pipeline(path)` 的实现入口，读取 YAML、装配注册组件、准备或复用索引。 |
+| [src/emergency_rag/retrieval/pipeline.py](src/emergency_rag/retrieval/pipeline.py) | 编排查询处理、召回、融合、扩展、重排、规则聚合、Gate 和最终 Top-K。 |
+| [src/emergency_rag/data/pipeline.py](src/emergency_rag/data/pipeline.py) | 读取规则、生成 SearchUnit、合并 metadata，并构建或加载数据集索引。 |
+| [src/emergency_rag/settings.py](src/emergency_rag/settings.py) | 从环境变量 / `.env` 读取共享模型配置；客户端按需创建。 |
+| [src/emergency_rag/registry.py](src/emergency_rag/registry.py) | 维护 YAML 组件注册表；新增组件时从对应阶段扩展。 |
+| [examples/retrieve_experiment.py](examples/retrieve_experiment.py) | 只检索的单题演示，不调用作答模型。 |
+| [examples/chat_experiment.py](examples/chat_experiment.py) | 检索后调用 Chat 作答的单题示例。 |
+| [examples/choice_qa_experiment.py](examples/choice_qa_experiment.py) | 检索后调用 TypeSafe / Jev 选择单项答案的示例。 |
+| [tests/](tests/) | 覆盖数据、索引、组件装配、检索流程、客户端与缓存行为。 |
+
+`retrieval/` 内按职责拆分阶段：`retrievers/` 负责 BM25 与 Dense 召回，`fusion/` 提供 RRF 和 Union，`rerank/` 提供 BCE 与 Qwen，`query/` 负责查询处理及缓存；`models.py` 定义查询上下文、Unit 候选、完整规则证据和检索结果。扩展规则单元构建策略见 `data/units/`，扩展检索组件则实现相应阶段的 ABC 并登记到 `registry.py`。
+
 ## 1. 第一次运行
 
 需要 Python 3.11+ 和 uv，在项目根目录安装依赖：
