@@ -20,7 +20,7 @@ from emergency_rag.retrieval.gate.base import EvidenceGate
 from emergency_rag.retrieval.query.base import QueryProcessor
 from emergency_rag.retrieval.rerank import bce, qwen
 from emergency_rag.retrieval.rerank.base import Reranker
-from emergency_rag.data.units import UnitBuilder
+from emergency_rag.data.units.base import UnitBuilder
 
 
 class EnhancedUnitBuilder(UnitBuilder):

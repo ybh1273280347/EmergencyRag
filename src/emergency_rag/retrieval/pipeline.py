@@ -93,9 +93,9 @@ class RetrievalPipeline:
         # 多子查询 × 多召回路，逐路调用检索器
         result_sets = []
         retrieval_counts: dict[str, int] = {}
-        for subquery in query_ctx.queries:
+        for query in query_ctx.queries:
             for retriever in self.retrievers:
-                result_set = retriever.retrieve(subquery, self.dataset)
+                result_set = retriever.retrieve(query, self.dataset)
                 result_sets.append(result_set)
                 retrieval_counts[retriever.name] = (
                     retrieval_counts.get(retriever.name, 0) + len(result_set)

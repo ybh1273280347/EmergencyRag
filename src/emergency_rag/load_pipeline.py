@@ -200,7 +200,7 @@ def load_pipeline(config_path: str | Path) -> RetrievalPipeline:
                 stage, retrieval_config[stage], interface
             )
 
-    # ---- 相对路径解析 ----
+    # 相对路径解析
     source = Path(dataset_config["source"]).expanduser()
     index_root = Path(dataset_config["index_root"]).expanduser()
 
